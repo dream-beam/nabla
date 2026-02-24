@@ -1,19 +1,15 @@
-# nabla
+# nabla ∇ Next-generation beamline alignment ∇
 khchan@lbl.gov, xchong@lbl.gov, awojdyla@lbl.gov
-
-∇ Next-generation beamline alignment ∇
 
 ![nabla-banner](assets/nabla-banner.jpg)
 
 This repository shares python scripts used for automated beamline alignment at ALS beamline 5.3.1, using [blop](https://github.com/bluesky/blop), a bayesian optimization routine that works with the [bluesky](https://blueskyproject.io/) experiment orchestration and data collection suite
 
 Collaborators:
-+ Thomas Morris (https://github.com/bluesky/blop)
++ Thomas Morris (NSLS-II)
 + Thomas Hopkins (NSLS-II)
 + Max Rakitin (NSLS-II)
 + Seij De Leon (ALS)
-
-https://github.com/bluesky/blop
 
 Collaborators:
 + Thomas Morris (https://github.com/bluesky/blop)
