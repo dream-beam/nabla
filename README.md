@@ -1,4 +1,4 @@
-# nabla ∇ Next-generation beamline alignment ∇
+# ∇ nabla ∇ Next-generation beamline alignment 
 khchan@lbl.gov, xchong@lbl.gov, awojdyla@lbl.gov
 
 ![nabla-banner](assets/nabla-banner.jpg)
