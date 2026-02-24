@@ -19,6 +19,10 @@ Collaborators:
 
 More infos and resources here: https://dreambeam.lbl.gov/resources/beamline-controls-epicsbluesky
 
+Live example of use using a pixelated diamond sensor:
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.18753746.svg)](https://doi.org/10.5281/zenodo.18753746)
+
+
 Publications:
 "A General Bayesian Algorithm for the Autonomous Alignment of Beamlines"
 T.W. Morris, M. Rakitin, Y. Du, M. Fedurin, A.C. Giles, D. Leshchev, W.H. Li, B. Romasky, E. Stavitski, A.L. Walter, P. Moeller, B.  Nash, A. Islegen-Wojdyla
