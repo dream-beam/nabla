@@ -12,7 +12,7 @@ from ophyd.areadetector.plugins import TIFFPlugin
 import os
 
 BASLER_FILES_ROOT = "/mnt/data531"
-BASLER_TEST_IMAGE_DIR = "20251113_test/%Y/%m/%d"   # e.g. "20251113_test/%Y/%m/%d" if you want date subdirs
+BASLER_5472_IMAGE_DIR = "scans/%Y/%m/%d/basler5472"   # e.g. "20251113_test/%Y/%m/%d" if you want date subdirs
 
 
 
@@ -185,6 +185,12 @@ class MonoEnergy(PseudoPositioner):
 ############### Basler TIFF Plugin ################
 
 class BaslerTIFFPlugin(FileStoreTIFFIterativeWrite, TIFFPlugin):
+    def __init__(self, *args, root_str="/nsls2/data/smi/proposals", md=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._md = md
+        self.__stage_cache = {}
+        self._asset_path = ''
+        self.root_str = root_str
 
     def describe(self):
         ret = super().describe()
@@ -251,8 +257,8 @@ class BaslerDetector(SingleTrigger, DetectorBase):
     tiff  = ADComponent(
         BaslerTIFFPlugin,
         'TIFF1:',
-        write_path_template=os.path.join(BASLER_FILES_ROOT, BASLER_TEST_IMAGE_DIR),
-        read_path_template=os.path.join(BASLER_FILES_ROOT, BASLER_TEST_IMAGE_DIR),
+        write_path_template=os.path.join(BASLER_FILES_ROOT, BASLER_5472_IMAGE_DIR),
+        read_path_template=os.path.join(BASLER_FILES_ROOT, BASLER_5472_IMAGE_DIR),
     )
 
 
