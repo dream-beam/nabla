@@ -11,10 +11,6 @@ from ophyd.areadetector.filestore_mixins import FileStoreTIFFIterativeWrite
 from ophyd.areadetector.plugins import TIFFPlugin
 import os
 
-BASLER_FILES_ROOT = "/mnt/data531"
-BASLER_5472_IMAGE_DIR = "scans/%Y/%m/%d/basler5472"   # e.g. "20251113_test/%Y/%m/%d" if you want date subdirs
-
-
 
 def test():
     print("this worked!")
@@ -183,9 +179,65 @@ class MonoEnergy(PseudoPositioner):
 
 
 ############### Basler TIFF Plugin ################
+BASLER_FILES_ROOT = "/mnt/data531"
+BASLER_5472_IMAGE_DIR = "scans/%Y/%m/%d/basler5472"   # e.g. "20251113_test/%Y/%m/%d" if you want date subdirs
+BASLER_2448_IMAGE_DIR = "scans/%Y/%m/%d/basler2448"   # e.g. "20251113_test/%Y/%m/%d" if you want date subdirs
+
+# class BaslerTIFFPlugin(FileStoreTIFFIterativeWrite, TIFFPlugin):
+#     def __init__(self, *args, root_str="/nsls2/data/smi/proposals", md=None, **kwargs):
+#         super().__init__(*args, **kwargs)
+#         self._md = md
+#         self.__stage_cache = {}
+#         self._asset_path = ''
+#         self.root_str = root_str
+
+#     def describe(self):
+#         ret = super().describe()
+#         key = self.parent._image_name
+
+#         color_mode = self.parent.cam.color_mode.get(as_string=True)
+#         num_images = self.parent.cam.num_images.get()
+#         height = self.array_size.height.get()
+#         width  = self.array_size.width.get()
+
+#         if color_mode == 'Mono':
+#             ret[key]['shape'] = [num_images, height, width]
+#         elif color_mode in ['RGB1', 'Bayer']:
+#             ret[key]['shape'] = [num_images, height, width, 3]
+#         else:
+#             raise RuntimeError(f"Unexpected color_mode: {color_mode!r}")
+
+#         # dtype mapping
+#         cam_dtype = self.data_type.get(as_string=True)
+#         type_map = {
+#             'UInt8':   '|u1',
+#             'UInt16':  '<u2',
+#             'Float32': '<f4',
+#             'Float64': '<f8',
+#             'Int32':   '<i4',
+#         }
+#         if cam_dtype in type_map:
+#             ret[key].setdefault('dtype_str', type_map[cam_dtype])
+
+#         return ret
 
 class BaslerTIFFPlugin(FileStoreTIFFIterativeWrite, TIFFPlugin):
-    def __init__(self, *args, root_str="/nsls2/data/smi/proposals", md=None, **kwargs):
+    def __init__(self, *args, root_str="/mnt/data531", md=None, **kwargs):
+        # 1. Ophyd passes the detector instance as kwargs['parent']
+        parent = kwargs.get('parent')
+        
+        # 2. Extract the directory we saved on the parent detector
+        if parent is not None and hasattr(parent, '_image_dir'):
+            image_dir = parent._image_dir
+        else:
+            image_dir = "scans/%Y/%m/%d/basler" # fallback
+
+        # 3. Build the paths and inject them before the mixin initializes
+        path = os.path.join(root_str, image_dir)
+        kwargs.setdefault('write_path_template', path)
+        kwargs.setdefault('read_path_template', path)
+        kwargs.setdefault('root', root_str)
+
         super().__init__(*args, **kwargs)
         self._md = md
         self.__stage_cache = {}
@@ -194,7 +246,11 @@ class BaslerTIFFPlugin(FileStoreTIFFIterativeWrite, TIFFPlugin):
 
     def describe(self):
         ret = super().describe()
-        key = self.parent._image_name
+        
+        # Using list(ret.keys())[0] prevents the KeyError you saw earlier 
+        # when parent._image_name doesn't perfectly match the plugin's name.
+        if not ret: return ret
+        key = list(ret.keys())[0]
 
         color_mode = self.parent.cam.color_mode.get(as_string=True)
         num_images = self.parent.cam.num_images.get()
@@ -222,7 +278,6 @@ class BaslerTIFFPlugin(FileStoreTIFFIterativeWrite, TIFFPlugin):
 
         return ret
 
-
 ############### Basler Cam ################
 
 class BaslerCam(CamBase):
@@ -246,22 +301,36 @@ class BaslerCam(CamBase):
 
 ############### Basler Detector ################
 
+# class BaslerDetector(SingleTrigger, DetectorBase):
+#     """
+#     Complete Basler area-detector device.
+#     Uses SingleTrigger mixin so bp.count() / bp.scan() work out of the box.
+#     """
+
+#     cam   = ADComponent(BaslerCam,          'cam1:')
+#     image = ADComponent(ImagePlugin,        'image1:')
+#     tiff  = ADComponent(
+#         BaslerTIFFPlugin,
+#         'TIFF1:',
+#         write_path_template=os.path.join(BASLER_FILES_ROOT, BASLER_5472_IMAGE_DIR),
+#         read_path_template=os.path.join(BASLER_FILES_ROOT, BASLER_5472_IMAGE_DIR),
+#     )
+
 class BaslerDetector(SingleTrigger, DetectorBase):
     """
     Complete Basler area-detector device.
     Uses SingleTrigger mixin so bp.count() / bp.scan() work out of the box.
     """
+    cam   = ADComponent(BaslerCam,        'cam1:')
+    image = ADComponent(ImagePlugin,      'image1:')
+    tiff  = ADComponent(BaslerTIFFPlugin, 'TIFF1:')
 
-    cam   = ADComponent(BaslerCam,          'cam1:')
-    image = ADComponent(ImagePlugin,        'image1:')
-    tiff  = ADComponent(
-        BaslerTIFFPlugin,
-        'TIFF1:',
-        write_path_template=os.path.join(BASLER_FILES_ROOT, BASLER_5472_IMAGE_DIR),
-        read_path_template=os.path.join(BASLER_FILES_ROOT, BASLER_5472_IMAGE_DIR),
-    )
-
-
+    def __init__(self, prefix, *, image_dir, **kwargs):
+        # Save the path so the TIFF plugin can find it during component instantiation
+        self._image_dir = image_dir
+        
+        # Now trigger Ophyd's standard build process
+        super().__init__(prefix, **kwargs)
 
 
 import time
