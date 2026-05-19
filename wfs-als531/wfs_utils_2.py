@@ -283,3 +283,59 @@ def calculate_rms_across_dataset(wavefront_list, x_coords_list=None):
     
     return mean_wavefront, rms_map, x_coords
 
+
+def fill_mask_gaps(mask):
+    """
+    Fill interior False gaps in a 1D boolean mask.
+
+    This function takes a 1D boolean mask and sets all elements between the
+    first True and the last True (inclusive) to True. Leading and trailing
+    False regions outside that span are preserved.
+
+    Parameters
+    ----------
+    mask : array_like of bool
+        Input 1D boolean mask.
+
+    Returns
+    -------
+    out : ndarray of bool
+        Output mask with interior gaps filled.
+
+    Notes
+    -----
+    Behavior examples:
+    - [False, True, False, True, False] -> [False, True, True, True, False]
+    - [False, False, False] -> unchanged
+    - [True, False, False] -> [True, True, True]
+
+    This is useful when selecting a contiguous valid region and ignoring
+    isolated interior dropouts.
+
+    Raises
+    ------
+    ValueError
+        If `mask` is not 1D.
+
+    Examples
+    --------
+    >>> m = np.array([False, True, False, True, False], dtype=bool)
+    >>> fill_mask_gaps(m)
+    array([False,  True,  True,  True, False])
+
+    >>> m = np.array([False, False, False], dtype=bool)
+    >>> fill_mask_gaps(m)
+    array([False, False, False])
+    """
+    mask = np.asarray(mask, dtype=bool)
+
+    if mask.ndim != 1:
+        raise ValueError("fill_mask_gaps expects a 1D boolean array.")
+
+    if not np.any(mask):
+        return mask.copy()
+
+    idx_true = np.where(mask)[0]
+    out = np.zeros_like(mask, dtype=bool)
+    out[idx_true[0]:idx_true[-1] + 1] = True
+    return out
