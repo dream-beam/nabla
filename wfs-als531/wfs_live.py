@@ -1,14 +1,23 @@
 """
-wfs_online.py
-─────────────
+wfs_live.py
+───────────
 
-Soft X-ray wavefront sensor analysis pipeline for live beamline use.
+X-ray wavefront sensor analysis pipeline for live beamline use.
+
+Reconstructs the X-ray wavefront from a single shearing-interferometer
+image using grating-based lateral shearing interferometry. The pipeline
+takes a 2-D detector image (Talbot-plane interferogram), extracts the
++1-order phase, removes the carrier, integrates to obtain W(x), and
+optionally propagates the reconstructed field to locate the focus.
+Works for both soft and hard X-rays; the only energy-dependent
+quantities are the wavelength and the optimal grating-to-detector
+distance.
 
 Pipeline
 --------
 For a single detector image / 1-D fringe profile, the full workflow is::
 
-    image  → extract_profile        →  1-D profile
+    image  → extract_profile         →  1-D profile
            → find_carrier            →  k_peak, FFT
            → extract_envelopes       →  I0, A1, complex_1st
            → find_phase_centroid     →  x_c, beam_mask
@@ -24,7 +33,7 @@ Usage at the beamline
 ---------------------
 The typical Jupyter workflow::
 
-    from wfs_online import quick_look
+    from wfs_live import quick_look
 
     # ROI was picked by eye from a raw image
     y_roi = slice(470, 486)
@@ -42,20 +51,17 @@ Dependencies
 - numpy, matplotlib                  (standard)
 - monoplus                           (in-house Fresnel propagator;
                                       provides propTF and secondmomt)
-- tiled  ==  0.2.1                   (required for live data access at the
-                                      beamline; newer versions (e.g. 0.2.9)
-                                      have been observed to fail — pin to 0.2.1
-                                      until verified otherwise)
 
 Acknowledgements
 ----------------
 This pipeline builds on work and discussions with:
-    - Dr. Antoine İşlegen-Wojdyla
+    - Dr. Antoine İşlegen-Wojdyla (awojdyla@lbl.gov)
     - Dr. Xiaoya Chong
     - Dr. Ka Hung (Henry) Chan
 
-Author : Wei "Francis" He (francisho@lbl.gov / whorwhey@gmail.com)
-Date   : May 2026
+Author       : Wei "Francis" He (francisho@lbl.gov / whorwhey@gmail.com)
+Created      : May 2026
+Last updated : 2026-06-01
 """
 
 from __future__ import annotations
@@ -65,11 +71,79 @@ import matplotlib.pyplot as plt
 
 import monoplus as mp   # in-house Fresnel propagator (propTF, secondmomt)
 
+import warnings
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
 def energy_eV_to_wavelength_m(energy_eV):
     """Convert photon energy [eV] to wavelength [m]."""
     return 1.23984e-6 / np.asarray(energy_eV, dtype=float)
+
+
+def fill_mask_gaps(mask):
+    """Fill False gaps between the leftmost and rightmost True values.
+
+    A "trust region" beam mask should be a single contiguous block —
+    if the threshold criterion (e.g. I0 > threshold) has small dips
+    in the middle of the beam, fill_mask_gaps closes them.
+
+    Parameters
+    ----------
+    mask : array_like of bool, shape (N,)
+        Boolean mask, typically from I0 > threshold.
+
+    Returns
+    -------
+    filled : ndarray of bool, shape (N,)
+        Mask with all False values between the first and last True
+        promoted to True. Returns the input unchanged if mask is all False.
+    """
+    mask = np.asarray(mask, dtype=bool)
+    if not mask.any():
+        return mask.copy()
+    i_first = np.argmax(mask)                          # first True
+    i_last  = len(mask) - 1 - np.argmax(mask[::-1])    # last True
+    filled = mask.copy()
+    filled[i_first:i_last + 1] = True
+    return filled
+
+
+def compute_visibility_masks(I0, A1, V_threshold=0.4, I0_threshold=0.02):
+    """Compute normalized visibility V and the trust mask V > V_threshold.
+
+    Single source of truth for V/trust_mask construction. Used by both
+    parabolic_focal_fit (via fit_mask = beam_mask ∩ trust_mask) and
+    build_caustic_amplitude (gated-mode amplitude support).
+
+    V is computed only inside safety_mask (an I0 floor that guards against
+    division by tiny intensities), then normalized to its in-mask max so
+    V_threshold is interpreted as a fraction of peak visibility.
+
+    Parameters
+    ----------
+    I0, A1 : ndarray (N,)
+        0th-order intensity envelope and +1-order fringe amplitude
+        from extract_envelopes.
+    V_threshold : float
+        Fraction of peak visibility above which fringes are trusted.
+    I0_threshold : float
+        Fraction of max(I0) defining safety_mask (V-computation floor).
+
+    Returns
+    -------
+    V           : ndarray (N,)         Normalized visibility (0 outside safety_mask)
+    trust_mask  : ndarray (N,) of bool Gap-filled (V > V_threshold)
+    safety_mask : ndarray (N,) of bool Gap-filled (I0 > I0_threshold * max)
+    """
+    I0 = np.asarray(I0, dtype=float)
+    A1 = np.asarray(A1, dtype=float)
+
+    safety_mask = fill_mask_gaps(I0 > I0_threshold * I0.max())
+    V = np.zeros_like(I0)
+    V[safety_mask] = 2 * A1[safety_mask] / I0[safety_mask]
+    if V[safety_mask].size and V[safety_mask].max() > 0:
+        V /= V[safety_mask].max()
+    trust_mask = fill_mask_gaps(V > V_threshold)
+    return V, trust_mask, safety_mask
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -103,7 +177,7 @@ def extract_profile(image_2d, roi, axis=1):
     return np.mean(sub, axis=axis).astype(float)
 
 
-def find_carrier(profile, dx, grating_pitch, band_factor=1.5):
+def find_carrier(profile, dx, grating_pitch, band_factor=1.5, plot=False):
     """Locate the carrier peak in the FFT of a fringe profile.
 
     The carrier is the +1-order spatial frequency of the shearing grating,
@@ -119,9 +193,12 @@ def find_carrier(profile, dx, grating_pitch, band_factor=1.5):
     grating_pitch : float  [m]
         Nominal grating pitch (fabrication spec).
     band_factor : float, optional (default 1.5)
-        Search band is (1/p / band_factor,  band_factor / p).
+        Search band is (1/p / band_factor,  1/p * band_factor).
         Set higher (e.g. 1.5–2.0) if strong tilt pulls the peak far from 1/p.
-
+    plot : bool, optional (default False)
+        If True, calls plot_carrier on the returned dict for a quick
+        diagnostic figure.
+    
     Returns
     -------
     out : dict
@@ -131,6 +208,8 @@ def find_carrier(profile, dx, grating_pitch, band_factor=1.5):
         fft_avg    ndarray  centered FFT of the profile (complex)
         freq       ndarray  centered frequency axis [cyc/m]
         band       (lo, hi) the search band actually used [cyc/m]
+        dc_amp     [a.u.]   |FFT| at zero frequency
+        bg_amp     [a.u.]   mean |FFT| over [1.2, 1.8] × k_peak
     """
     profile = np.asarray(profile, dtype=float).ravel()
     N = len(profile)
@@ -154,14 +233,38 @@ def find_carrier(profile, dx, grating_pitch, band_factor=1.5):
     k_peak      = freq[carrier_idx]
     k_amp       = float(np.abs(fft_avg[carrier_idx]))
 
-    return dict(
+    # Band-edge proximity check: warn if k_peak lands within 5% of k_ideal
+    # from either edge of the search band — usually a sign band_factor is too small.
+    margin = 0.05 * k_ideal
+    if (k_peak - band_lo) < margin or (band_hi - k_peak) < margin:
+        warnings.warn(
+            f"k_peak={k_peak*1e-3:.1f} cyc/mm landed within "
+            f"5% of k_ideal of a search-band edge "
+            f"[{band_lo*1e-3:.1f}, {band_hi*1e-3:.1f}] cyc/mm. "
+            f"Consider increasing band_factor (currently {band_factor}).",
+            stacklevel=2,
+        )
+
+    # DC amplitude and band background for quality metrics (Phase G).
+    # bg_amp: mean |F| over [1.2*k_peak, 1.8*k_peak], avoiding the carrier
+    # and its 2nd harmonic.
+    dc_amp = float(np.abs(fft_avg[freq == 0])[0])
+    bg_mask = (freq >= 1.2 * k_peak) & (freq <= 1.8 * k_peak)
+    bg_amp = float(np.abs(fft_avg[bg_mask]).mean()) if bg_mask.any() else float('nan')
+
+    out = dict(
         k_peak  = k_peak,
         k_amp   = k_amp,
         k_ideal = k_ideal,
+        dc_amp  = dc_amp,
+        bg_amp  = bg_amp,
         fft_avg = fft_avg,
         freq    = freq,
         band    = (band_lo, band_hi),
     )
+    if plot:
+        plot_carrier(out)
+    return out
 
 
 def extract_envelopes(fft_avg, freq, k_peak,
@@ -187,8 +290,8 @@ def extract_envelopes(fft_avg, freq, k_peak,
     out : dict
         complex_0th : ndarray (N,) complex   0th-order complex field
         complex_1st : ndarray (N,) complex   +1-order complex field
-        I0          : ndarray (N,)           |complex_0th|² — beam intensity
-        A1          : ndarray (N,)           |complex_1st|  — fringe amplitude
+        I0          : ndarray (N,)           |complex_0th| — intensity envelope a(x)
+        A1          : ndarray (N,)           |complex_1st| — intensity envelope b/2
         sigma_0     : float [cyc/m]          0th-order filter width
         sigma_1     : float [cyc/m]          +1-order filter width
         gauss_lp    : ndarray (N,)           0th-order filter (for plotting)
@@ -201,7 +304,7 @@ def extract_envelopes(fft_avg, freq, k_peak,
     gauss_lp    = np.exp(-0.5 * (freq / sigma_0)**2)
     fft_filt_0  = fft_avg * gauss_lp
     complex_0th = np.fft.ifft(np.fft.ifftshift(fft_filt_0))
-    I0          = np.abs(complex_0th)**2
+    I0          = np.abs(complex_0th)        # intensity envelope; linear after 2026-06-01 audit
 
     # +1-order: bandpass Gaussian centered at f = k_peak
     gauss_bp    = np.exp(-0.5 * ((freq - k_peak) / sigma_1)**2)
@@ -221,39 +324,102 @@ def extract_envelopes(fft_avg, freq, k_peak,
     )
 
 
-def fill_mask_gaps(mask):
-    """Fill False gaps between the leftmost and rightmost True values.
+def build_caustic_amplitude(
+    I0, A1,
+    mode='field_envelope',
+    V_threshold=0.4,
+    I0_threshold=0.02,
+    V=None,
+    trust_mask=None,
+    safety_mask=None,
+    debug=False,
+    plot=None,
+):
+    """Construct the amplitude A(x) for propagate_to_focus.
 
-    A "trust region" beam mask should be a single contiguous block —
-    if the threshold criterion (e.g. I0 > threshold) has small dips
-    in the middle of the beam, fill_mask_gaps closes them.
+    A(x) = √I₀(x) in 'field_envelope' mode (smooth physical envelope).
+    A(x) = √I₀(x) · trust_mask in 'gated' mode (zeros wings outside
+    fringe coverage; produces a sharp aperture penalty on propagation
+    but correctly excludes off-axis intensity humps).
 
     Parameters
     ----------
-    mask : array_like of bool, shape (N,)
-        Boolean mask, typically from I0 > threshold.
+    I0, A1 : ndarray (N,)
+        Envelopes from extract_envelopes.
+    mode : {'field_envelope', 'gated'}
+        Amplitude construction mode.
+    V_threshold : float, default 0.4
+        Fraction of peak normalized visibility above which fringes are
+        trusted. Used only if trust_mask is computed here.
+    I0_threshold : float, default 0.02
+        I0 floor for V computation (passed to compute_visibility_masks).
+        Used only if V/trust_mask/safety_mask are computed here.
+    V, trust_mask, safety_mask : ndarray, optional
+        Precomputed outputs of compute_visibility_masks. If any is None,
+        all three are recomputed internally. Pass these from
+        reconstruct_single to avoid redundant computation.
+    debug : bool, optional (default False)
+        If True, return a dict containing A plus diagnostic arrays
+        (V, safety_mask, trust_mask, mode_used) instead of just A.
+    plot : bool or None, optional (default None)
+        If True, show plot_caustic_amplitude figure. If False, never plot.
+        If None, default is True when mode='gated' and False when
+        mode='field_envelope'. Set plot=False explicitly to suppress
+        when calling from a loop or orchestrator.
 
     Returns
     -------
-    filled : ndarray of bool, shape (N,)
-        Mask with all False values between the first and last True
-        promoted to True. Returns the input unchanged if mask is all False.
+    A : ndarray, shape (N,)
+        Returned when debug=False (current behavior).
+    debug_dict : dict
+        Returned when debug=True. Keys: A, V, safety_mask, trust_mask,
+        mode_used, I0, A1, V_threshold.
     """
-    mask = np.asarray(mask, dtype=bool)
-    if not mask.any():
-        return mask.copy()
-    i_first = np.argmax(mask)                          # first True
-    i_last  = len(mask) - 1 - np.argmax(mask[::-1])    # last True
-    filled = mask.copy()
-    filled[i_first:i_last + 1] = True
-    return filled
+    I0 = np.asarray(I0, dtype=float)
+    A1 = np.asarray(A1, dtype=float)
+
+    if plot is None:
+        plot = (mode == 'gated')
+
+    if V is None or trust_mask is None or safety_mask is None:
+        V, trust_mask, safety_mask = compute_visibility_masks(
+            I0, A1, V_threshold=V_threshold, I0_threshold=I0_threshold,
+        )
+
+    if mode == 'field_envelope':
+        A = np.sqrt(np.clip(I0, 0, None))
+    elif mode == 'gated':
+        A = np.sqrt(np.clip(I0, 0, None)) * trust_mask
+    else:
+        raise ValueError(
+            f"Unknown mode: {mode!r}. Use 'field_envelope' or 'gated'."
+        )
+
+    if debug or plot:
+        debug_dict = dict(
+            A           = A,
+            V           = V,
+            safety_mask = safety_mask,
+            trust_mask  = trust_mask,
+            mode_used   = mode,
+            I0          = I0,
+            A1          = A1,
+            V_threshold = V_threshold,
+        )
+        if plot:
+            plot_caustic_amplitude(debug_dict)
+        if debug:
+            return debug_dict
+
+    return A
 
 
-def find_phase_centroid(I0, A1, threshold=None):
+def find_phase_centroid(I0, A1, threshold=None, fill_gaps=True):
     """Find the beam centroid for use as phase reference.
 
-    Builds a beam mask from I0 > threshold * max(I0), fills gaps,
-    then computes the centroid weighted by |A1|² inside that mask.
+    Builds a beam mask from I0 > threshold * max(I0), optionally fills
+    interior gaps, then computes the centroid weighted by A1 inside that
+    mask.
 
     Parameters
     ----------
@@ -263,15 +429,21 @@ def find_phase_centroid(I0, A1, threshold=None):
         +1-order fringe amplitude (from extract_envelopes).
     threshold : float, optional (default 1/e² ≈ 0.135)
         Fraction of I0 peak above which pixels are kept in the beam mask.
+        I0 is the linear intensity envelope, so this selects the 1/e²
+        intensity radius (standard beam-radius convention).
+    fill_gaps : bool, optional (default True)
+        If True, close interior holes in the raw threshold mask.
+        Set False when off-axis structure above threshold would be
+        incorrectly bridged into the main beam by gap-fill.
 
     Returns
     -------
     out : dict
         x_c          : int        centroid pixel index
-        beam_mask    : ndarray    gap-filled boolean mask (N,)
+        beam_mask    : ndarray    boolean mask (N,), gap-filled if fill_gaps=True
         threshold    : float      threshold actually used
         n_mask_px    : int        number of True pixels in mask
-        n_filled_px  : int        number of False→True conversions by gap-fill
+        n_filled_px  : int        False→True conversions by gap-fill (0 if fill_gaps=False)
     """
     if threshold is None:
         threshold = np.exp(-2)   # 1/e² ≈ 0.135
@@ -279,8 +451,11 @@ def find_phase_centroid(I0, A1, threshold=None):
     I0 = np.asarray(I0, dtype=float)
     A1 = np.asarray(A1, dtype=float)
 
-    raw_mask  = I0 > threshold * I0.max()
-    beam_mask = fill_mask_gaps(raw_mask)
+    raw_mask = I0 > threshold * I0.max()
+    if fill_gaps:
+        beam_mask = fill_mask_gaps(raw_mask)
+    else:
+        beam_mask = raw_mask
 
     if not beam_mask.any():
         raise ValueError(
@@ -288,7 +463,7 @@ def find_phase_centroid(I0, A1, threshold=None):
             f"Check I0 (max={I0.max():.3g}) or lower threshold."
         )
 
-    weights = A1[beam_mask] ** 2
+    weights = A1[beam_mask]        # A1 is intensity (b/2); linear weighting → standard intensity-weighted centroid (2026-06-01 audit)
     x_idx   = np.arange(len(I0))
     x_c     = int(np.average(x_idx[beam_mask], weights=weights))
 
@@ -297,7 +472,7 @@ def find_phase_centroid(I0, A1, threshold=None):
         beam_mask   = beam_mask,
         threshold   = threshold,
         n_mask_px   = int(beam_mask.sum()),
-        n_filled_px = int(beam_mask.sum() - raw_mask.sum()),
+        n_filled_px = int(beam_mask.sum() - raw_mask.sum()),  # 0 when fill_gaps=False
     )
 
 
@@ -365,7 +540,7 @@ def reconstruct_wavefront(complex_1st, dx, grating_pitch, wavelength, z_gd, x_c)
     )
 
 
-def parabolic_focal_fit(W_rad, x_m, wavelength, mask=None):
+def parabolic_focal_fit(W_rad, x_m, wavelength, mask=None, n_min_fit=50):
     """Fit a parabola to W(x) and predict focal length from defocus.
 
     For a converging wave, W(x) = -k x² / (2f) where k = 2π/λ.
@@ -384,6 +559,10 @@ def parabolic_focal_fit(W_rad, x_m, wavelength, mask=None):
         X-ray wavelength.
     mask : array_like (N,) of bool, optional
         Fit region. If None, fits over the entire array.
+    n_min_fit : int, optional (default 50)
+        Soft warning threshold on mask size. Below 3, raises ValueError
+        (polyfit ill-posed). Between 3 and n_min_fit, emits a
+        RuntimeWarning; the fit still runs but may be unreliable.
 
     Returns
     -------
@@ -401,18 +580,29 @@ def parabolic_focal_fit(W_rad, x_m, wavelength, mask=None):
     if mask is None:
         mask = np.ones_like(W_rad, dtype=bool)
 
-    # Fit parabola inside mask only
+    n_fit = int(mask.sum())
+    if n_fit < 3:
+        raise ValueError(
+            f"parabolic_focal_fit: mask has {n_fit} pixels, need ≥3 for a "
+            f"quadratic fit. Likely V_threshold too high, no fringes "
+            f"detected, or empty beam_mask."
+        )
+    if n_fit < n_min_fit:
+        warnings.warn(
+            f"parabolic_focal_fit: mask has only {n_fit} pixels "
+            f"(< n_min_fit={n_min_fit}). Fit may be unreliable.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
     a2, a1, a0 = np.polyfit(x_m[mask], W_rad[mask], 2)
 
-    # Evaluate fit and residual everywhere
     W_para_rad  = a2 * x_m**2 + a1 * x_m + a0
     W_resid_rad = W_rad - W_para_rad
 
-    # Predicted focal length offset (uses defocus coefficient a2)
     k = 2 * np.pi / wavelength
     f_pred = -k / (2 * a2)
 
-    # Residual statistics inside the mask (the meaningful region)
     W_resid_nm   = W_resid_rad * wavelength / (2 * np.pi) * 1e9
     rms_resid_nm = float(np.std(W_resid_nm[mask]))
     pv_resid_nm  = float(W_resid_nm[mask].max() - W_resid_nm[mask].min())
@@ -429,56 +619,87 @@ def parabolic_focal_fit(W_rad, x_m, wavelength, mask=None):
     )
 
 
-def propagate_to_focus(A, W_rad, dx, wavelength, z_range_m, x_m=None):
-    """Fresnel-propagate the reconstructed field to find the focus.
+def propagate_to_focus(
+    A, W_rad, dx, wavelength, z_range_m,
+    x_m=None,
+    f_pred_m=None,
+    focus_search_halfwidth_m=None,
+    focus_locator='fwhm_min',
+):
+    """Fresnel-propagate the reconstructed field and locate the focus.
 
-    Constructs the field at the detector plane
-        E_det(x) = A(x) · exp[i W(x)]
-    and propagates it over a range of z values using monoplus.propTF.
-    The focus is identified as the z at which the RMS beam size σ(z)
-    is minimum.
+    Builds E_det(x) = A(x) · exp[i W(x)], propagates over z_range_m via
+    monoplus.propTF, and returns the caustic and a chosen focal plane.
+
+    Two diagnostic curves are computed across the full z_range:
+        sigma_rms(z)   — second moment of |E(x,z)|², wing-sensitive.
+        fwhm_z(z)      — from monoplus.fwhm, returned in σ-equivalent
+                         units (FWHM / 2.35), so directly comparable
+                         to sigma_rms numerically. Less wing-sensitive,
+                         but noisy in regions with fragmented intensity.
+
+    Focus localization is restricted to a window centered on f_pred_m,
+    width 2 × focus_search_halfwidth_m. This prevents off-axis wing
+    structure from pulling the minimum to a spurious upstream location.
+    If the minimum lands on the window boundary, `focus_at_edge=True`
+    is returned along with a RuntimeWarning — likely a too-tight window.
 
     Parameters
     ----------
-    A : array_like (N,)  [a.u.]
-        Field amplitude at the detector plane. Use A1 from extract_envelopes
-        — it naturally tapers to ~0 outside the beam, which suppresses
-        edge-diffraction artifacts during propagation.
+    A : array_like (N,)
+        Detector-plane field amplitude (from build_caustic_amplitude).
     W_rad : array_like (N,)  [rad]
-        Reconstructed wavefront (from reconstruct_wavefront).
+        Reconstructed wavefront.
     dx : float  [m]
         Pixel pitch.
     wavelength : float  [m]
-        X-ray wavelength.
     z_range_m : array_like  [m]
-        Propagation distances to evaluate. e.g. np.linspace(-3, 3, 601).
+        Propagation distances to evaluate.
     x_m : array_like (N,) [m], optional
-        Spatial coordinate — needed for σ_rms computation. If None,
-        uses (np.arange(N) - N//2) * dx.
+        Spatial coordinate. Defaults to (np.arange(N) - N//2) * dx.
+    f_pred_m : float [m], optional
+        Geometric focus from parabolic_focal_fit. Centers the bounded
+        search window. If None, falls back to global argmin on
+        sigma_rms with a warning.
+    focus_search_halfwidth_m : float [m], optional
+        Half-width of the search window around f_pred_m. If None,
+        auto-computed as max(0.15 * |f_pred_m|, 0.05 m).
+    focus_locator : {'fwhm_min', 'sigma_min', 'geometric'}, default 'fwhm_min'
+        Curve to minimize for z_focus.
 
     Returns
     -------
     out : dict
-        E_caustic     : ndarray (N, Z) complex   field at each z
-        I_caustic     : ndarray (N, Z)           |E|² intensity caustic
-        sigma_rms     : ndarray (Z,) [m]         σ_rms vs z
-        z_range_m     : ndarray (Z,) [m]
-        z_focus       : float [m]                z minimizing σ_rms
-        sigma_focus   : float [m]                σ_rms at focus
-        i_focus       : int                      index of focus in z_range_m
-        E_focus       : ndarray (N,) complex     field at focus
-        I_focus       : ndarray (N,)             |E|² at focus
+        E_caustic        : ndarray (N, Z) complex
+        I_caustic        : ndarray (N, Z)
+        sigma_rms        : ndarray (Z,) [m]
+        fwhm_z           : ndarray (Z,) [m]   FWHM/2.35 (σ-equivalent)
+        z_range_m        : ndarray (Z,) [m]
+        z_focus          : float [m]
+        sigma_focus      : float [m]
+        fwhm_focus       : float [m]
+        i_focus          : int
+        z_focus_locator  : str
+        focus_at_edge    : bool
+        E_focus, I_focus : ndarray (N,)
     """
+    if focus_locator not in ('sigma_min', 'fwhm_min', 'geometric'):
+        raise ValueError(
+            f"Unknown focus_locator: {focus_locator!r}. "
+            f"Use 'sigma_min', 'fwhm_min', or 'geometric'."
+        )
+
+    if focus_search_halfwidth_m is None:
+        focus_search_halfwidth_m = (max(0.15 * abs(f_pred_m), 0.05)
+                                    if f_pred_m is not None else 0.0)
+
     N = len(A)
     if x_m is None:
         x_m = (np.arange(N) - N // 2) * dx
+    L_m = N * dx
 
-    L_m = N * dx                      # physical array length
-
-    # Build detector-plane complex field
+    # Detector-plane field, propagated over z_range_m
     E_det = A * np.exp(1j * W_rad)
-
-    # Propagate over z_range
     z_range_m = np.asarray(z_range_m, dtype=float)
     Z = len(z_range_m)
 
@@ -487,23 +708,106 @@ def propagate_to_focus(A, W_rad, dx, wavelength, z_range_m, x_m=None):
         E_caustic[:, i_z] = mp.propTF(E_det, L_m, wavelength, z)
 
     I_caustic = np.abs(E_caustic)**2
-    sigma_rms = mp.secondmomt(Z, x_m, E_caustic)
 
-    # Locate focus
-    i_focus     = int(np.argmin(sigma_rms))
-    z_focus     = float(z_range_m[i_focus])
+    # Diagnostic curves — both computed across the full range.
+    # Outside the focus search window, fwhm_z may be unreliable on
+    # wing-dominated frames (multi-peak structure inflates the metric),
+    # but the values are kept for plotting and post-hoc inspection.
+    sigma_rms = mp.secondmomt(Z, x_m, E_caustic)
+    fwhm_z    = mp.fwhm(Z, x_m, E_caustic)
+
+    # --- Focus localization ---
+    if focus_locator == 'geometric':
+        if f_pred_m is None:
+            raise ValueError(
+                "focus_locator='geometric' requires f_pred_m to be provided."
+            )
+        i_focus = int(np.argmin(np.abs(z_range_m - f_pred_m)))
+        z_focus = float(z_range_m[i_focus])
+        focus_at_edge = (i_focus == 0) or (i_focus == Z - 1)
+        if abs(z_focus - f_pred_m) > 0.5 * focus_search_halfwidth_m:
+            warnings.warn(
+                f"propagate_to_focus: f_pred_m={f_pred_m:+.3f} m is far from "
+                f"the nearest z in z_range_m ({z_focus:+.3f} m). "
+                f"Consider widening z_range_m around f_pred.",
+                RuntimeWarning, stacklevel=2,
+            )
+
+    else:
+        # 'sigma_min' or 'fwhm_min'
+        curve = sigma_rms if focus_locator == 'sigma_min' else fwhm_z
+
+        if f_pred_m is None:
+            # No anchor: fall back to global sigma_min, regardless of request.
+            warnings.warn(
+                "propagate_to_focus: f_pred_m not provided; using global "
+                "argmin on sigma_rms. Pass f_pred_m to enable bounded "
+                "fwhm_min.",
+                RuntimeWarning, stacklevel=2,
+            )
+            i_focus = int(np.argmin(sigma_rms))
+            focus_at_edge = (i_focus == 0) or (i_focus == Z - 1)
+        else:
+            idx_window = np.where(
+                (z_range_m >= f_pred_m - focus_search_halfwidth_m) &
+                (z_range_m <= f_pred_m + focus_search_halfwidth_m)
+            )[0]
+            if len(idx_window) == 0:
+                warnings.warn(
+                    f"propagate_to_focus: search window "
+                    f"[{f_pred_m - focus_search_halfwidth_m:+.3f}, "
+                    f"{f_pred_m + focus_search_halfwidth_m:+.3f}] m "
+                    f"does not overlap z_range_m. Falling back to geometric.",
+                    RuntimeWarning, stacklevel=2,
+                )
+                i_focus = int(np.argmin(np.abs(z_range_m - f_pred_m)))
+                focus_at_edge = True
+            else:
+                sub_curve = curve[idx_window]
+                if np.all(np.isnan(sub_curve)):
+                    warnings.warn(
+                        f"propagate_to_focus: {focus_locator} curve is all "
+                        f"NaN inside the search window. Falling back to "
+                        f"geometric.",
+                        RuntimeWarning, stacklevel=2,
+                    )
+                    i_focus = int(np.argmin(np.abs(z_range_m - f_pred_m)))
+                    focus_at_edge = True
+                else:
+                    sub_min = int(np.nanargmin(sub_curve))
+                    i_focus = int(idx_window[sub_min])
+                    focus_at_edge = (sub_min == 0) or \
+                                    (sub_min == len(sub_curve) - 1)
+                    if focus_at_edge:
+                        warnings.warn(
+                            f"propagate_to_focus: {focus_locator} minimum "
+                            f"landed on the search window boundary "
+                            f"(z={z_range_m[i_focus]:+.3f} m, window "
+                            f"±{focus_search_halfwidth_m:.3f} m around "
+                            f"f_pred={f_pred_m:+.3f} m).",
+                            RuntimeWarning, stacklevel=2,
+                        )
+
+        z_focus = float(z_range_m[i_focus])
+
     sigma_focus = float(sigma_rms[i_focus])
+    fwhm_focus  = float(fwhm_z[i_focus]) if not np.isnan(fwhm_z[i_focus]) else np.nan
 
     return dict(
-        E_caustic   = E_caustic,
-        I_caustic   = I_caustic,
-        sigma_rms   = sigma_rms,
-        z_range_m   = z_range_m,
-        z_focus     = z_focus,
-        sigma_focus = sigma_focus,
-        i_focus     = i_focus,
-        E_focus     = E_caustic[:, i_focus],
-        I_focus     = I_caustic[:, i_focus],
+        E_caustic       = E_caustic,
+        I_caustic       = I_caustic,
+        sigma_rms       = sigma_rms,
+        fwhm_z          = fwhm_z,
+        z_range_m       = z_range_m,
+        z_focus         = z_focus,
+        sigma_focus     = sigma_focus,
+        fwhm_focus      = fwhm_focus,
+        i_focus         = i_focus,
+        z_focus_locator = focus_locator,
+        focus_search_halfwidth_m = focus_search_halfwidth_m,
+        focus_at_edge   = focus_at_edge,
+        E_focus         = E_caustic[:, i_focus],
+        I_focus         = I_caustic[:, i_focus],
     )
 
 
@@ -587,10 +891,16 @@ def reconstruct_single(
     band_factor=1.5,
     sigma_ratio_0=5, sigma_ratio_1=10,
     centroid_threshold=None,
+    fill_gaps=True,
     propagate=False,
     z_range_m=None,
     focus_threshold=None,
-    k_amp_good=2000, k_amp_bad=500,
+    caustic_amplitude='field_envelope',
+    V_threshold=0.4,
+    I0_threshold=0.02,
+    focus_search_halfwidth_m=None,
+    focus_locator='fwhm_min',
+    r_good=50, r_bad=200, 
     verbose=False,
 ):
     """Full single-frame WFS pipeline: image → wavefront (+ optional propagation).
@@ -622,17 +932,40 @@ def reconstruct_single(
         Gaussian filter widths in units of k_peak.
     centroid_threshold : float
         I0 mask threshold (default 1/e²).
+    fill_gaps : bool
+        Whether find_phase_centroid gap-fills the beam mask (default True).
+        Set False to disable gap-fill when off-axis structure would be
+        incorrectly bridged into the main beam (Stage B off-axis hump case).
     propagate : bool
         If True, run steps 8a + 8b (propagation + W at focus).
     z_range_m : array_like, optional
         Custom z range for propagation. If None, auto-set from f_pred.
     focus_threshold : float
         Focus mask threshold (default 1/e²).
-    k_amp_good, k_amp_bad : float
-        Quality thresholds on carrier amplitude:
-        - amp >= k_amp_good → 'good'
-        - k_amp_bad <= amp < k_amp_good → 'ok'
-        - amp < k_amp_bad → 'bad' (likely near-focus, no fringes)
+    caustic_amplitude : {'field_envelope', 'gated'}
+        Mode for build_caustic_amplitude (default 'field_envelope').
+        See that function for mode semantics.
+    V_threshold, I0_threshold : float
+        Forwarded to build_caustic_amplitude when caustic_amplitude='gated'.
+    focus_search_halfwidth_m : float [m], default 0.2
+        Half-width of the bounded search window for focus localization.
+        z_focus is selected as the argmin of the chosen locator curve
+        within [f_pred - halfwidth, f_pred + halfwidth]. Prevents
+        off-axis wing structure from pulling z_focus to a spurious
+        upstream location.
+    focus_locator : {'sigma_min', 'fwhm_min', 'geometric'}, default 'sigma_min'
+        Curve to minimize for z_focus. 'sigma_min' uses σ_rms(z),
+        'fwhm_min' uses FWHM(z), 'geometric' skips the search and
+        sets z_focus = f_pred.
+    r_good, r_bad : float
+        Quality thresholds on the DC/carrier amplitude ratio
+        r = |F(0)| / |F(k_peak)|. Lower r means stronger fringes
+        relative to the unmodulated background.
+        - r < r_good           → 'good'
+        - r_good ≤ r < r_bad   → 'ok'
+        - r ≥ r_bad            → 'bad' (likely near-focus, fringes lost)
+        Defaults (50, 200) are working values pending degraded-frame
+        calibration.
     verbose : bool
         Print a one-line summary.
 
@@ -659,10 +992,12 @@ def reconstruct_single(
     # --- Step 2: carrier ---
     car = find_carrier(profile, dx, grating_pitch, band_factor=band_factor)
 
-    # --- Quality flag based on carrier amplitude ---
-    if car['k_amp'] >= k_amp_good:
+    # --- Quality flag based on DC/carrier amplitude ratio ---
+    dc_carrier_ratio = car['dc_amp'] / car['k_amp']
+    carrier_snr      = car['k_amp']  / car['bg_amp']
+    if dc_carrier_ratio < r_good:
         quality = 'good'
-    elif car['k_amp'] >= k_amp_bad:
+    elif dc_carrier_ratio < r_bad:
         quality = 'ok'
     else:
         quality = 'bad'
@@ -674,15 +1009,24 @@ def reconstruct_single(
 
     # --- Step 4: centroid ---
     cen = find_phase_centroid(env['I0'], env['A1'],
-                              threshold=centroid_threshold)
+                              threshold=centroid_threshold,
+                              fill_gaps=fill_gaps)
 
     # --- Step 5: wavefront ---
     wfr = reconstruct_wavefront(env['complex_1st'], dx, grating_pitch,
                                 wavelength, z_gd, x_c=cen['x_c'])
+    # --- Prepare fit_mask: beam_mask ∩ trust_mask ---
+    # Trust mask excludes off-axis humps (high I0 but low V) that would
+    # otherwise pollute the parabolic fit. Reused by Step 7 (caustic).
+    V, trust_mask, safety_mask = compute_visibility_masks(
+        env['I0'], env['A1'],
+        V_threshold=V_threshold, I0_threshold=I0_threshold,
+    )
+    fit_mask = cen['beam_mask'] & trust_mask    
 
     # --- Step 6: parabolic fit + f_pred ---
     fit = parabolic_focal_fit(wfr['W_rad'], wfr['x_m'], wavelength,
-                              mask=cen['beam_mask'])
+                              mask=fit_mask)
 
     # Convenience conversions
     W_nm = wfr['W_rad'] * wavelength / (2 * np.pi) * 1e9
@@ -703,6 +1047,10 @@ def reconstruct_single(
         fft_avg           = car['fft_avg'],
         freq              = car['freq'],
         carrier_band      = car['band'],
+        dc_amp            = car['dc_amp'],
+        bg_amp            = car['bg_amp'],
+        dc_carrier_ratio  = dc_carrier_ratio,
+        carrier_snr       = carrier_snr,
         quality           = quality,
         # step 3
         I0                = env['I0'],
@@ -715,6 +1063,13 @@ def reconstruct_single(
         x_c               = cen['x_c'],
         beam_mask         = cen['beam_mask'],
         n_mask_px         = cen['n_mask_px'],
+        # fit-mask preparation (used by step 6 and step 7)
+        V                 = V,
+        trust_mask        = trust_mask,
+        safety_mask       = safety_mask,
+        fit_mask          = fit_mask,
+        n_fit_px          = int(fit_mask.sum()),
+        V_threshold       = V_threshold,
         # step 5
         W_rad             = wfr['W_rad'],
         W_nm              = W_nm,
@@ -746,17 +1101,36 @@ def reconstruct_single(
             n_pts = int(half / 0.02) * 2 + 1   # ~20 mm step, odd count
             z_range_m = np.linspace(fit['f_pred'] - half,
                                     fit['f_pred'] + half, n_pts)
-        prop = propagate_to_focus(env['A1'], wfr['W_rad'], dx, wavelength,
-                                  z_range_m, x_m=wfr['x_m'])
+        A_caustic = build_caustic_amplitude(
+            env['I0'], env['A1'],
+            mode=caustic_amplitude,
+            V_threshold=V_threshold, I0_threshold=I0_threshold,
+            V=V, trust_mask=trust_mask, safety_mask=safety_mask,
+            plot=False,
+        )
+        prop = propagate_to_focus(
+            A_caustic, wfr['W_rad'], dx, wavelength, z_range_m,
+            x_m=wfr['x_m'],
+            f_pred_m=fit['f_pred'],
+            focus_search_halfwidth_m=focus_search_halfwidth_m,
+            focus_locator=focus_locator,
+        )
         wff  = wavefront_at_focus(prop, wavelength, dx, threshold=focus_threshold)
 
         result.update(dict(
             # step 7
+            A_caustic       = A_caustic,
+            caustic_mode    = caustic_amplitude,
             z_range_m       = prop['z_range_m'],
             sigma_rms       = prop['sigma_rms'],
+            fwhm_z          = prop['fwhm_z'],
             z_focus         = prop['z_focus'],
             sigma_focus     = prop['sigma_focus'],
+            fwhm_focus      = prop['fwhm_focus'],
             i_focus         = prop['i_focus'],
+            z_focus_locator = prop['z_focus_locator'],
+            focus_search_halfwidth_m = prop['focus_search_halfwidth_m'],
+            focus_at_edge   = prop['focus_at_edge'],
             E_focus         = prop['E_focus'],
             I_focus         = prop['I_focus'],
             I_caustic       = prop['I_caustic'],
@@ -772,11 +1146,14 @@ def reconstruct_single(
     if verbose:
         msg = (f"[{quality:>4}]  λ={wavelength*1e9:.2f}nm  "
                f"k_peak={car['k_peak']*1e-3:.1f} cyc/mm  "
-               f"k_amp={car['k_amp']:.0f}  "
+               f"r_DC={dc_carrier_ratio:.1f}  "
+               f"SNR={carrier_snr:.1f}  "
                f"f_pred={fit['f_pred']:+.2f}m  "
                f"RMS_W={rms_W_nm:.1f}nm  RMS_resid={fit['rms_resid_nm']:.3f}nm")
         if propagate:
-            msg += (f"  z_focus={prop['z_focus']:+.2f}m  "
+            edge_tag = ' *EDGE*' if prop['focus_at_edge'] else ''
+            msg += (f"  z_focus={prop['z_focus']:+.2f}m"
+                    f"({prop['z_focus_locator']}){edge_tag}  "
                     f"RMS@focus={wff['rms_at_focus_nm']:.3f}nm")
         print(msg)
 
@@ -815,7 +1192,7 @@ def quick_look(
         Figure suptitle.
     **kwargs
         Any other reconstruct_single kwargs (band_factor, sigma_ratio_0/1,
-        centroid_threshold, k_amp_good/bad, z_range_m, ...).
+        centroid_threshold, r_good/bad, z_range_m, ...).
 
     Returns
     -------
@@ -844,7 +1221,7 @@ def plot_result(result, title='', figsize=None):
     Panels (always shown):
         1. Fringe profile (raw)
         2. FFT |spectrum| with carrier and filters
-        3. Envelopes I0, |A1|² and beam mask
+        3. Envelopes I0, A1 and beam mask
         4. Wavefront W(x) with parabolic fit
         5. Residual (W − fit) inside beam mask
 
@@ -879,6 +1256,8 @@ def plot_result(result, title='', figsize=None):
     N     = len(result['profile'])
     freq  = result['freq']
     m     = result['beam_mask']
+    fm    = result['fit_mask']
+    rejected = m & ~result['trust_mask']
     lam   = result['wavelength']
 
     # ─── Panel 1: raw fringe profile ─────────────────────────────────────────
@@ -906,23 +1285,30 @@ def plot_result(result, title='', figsize=None):
     ax.set_xlabel('Spatial frequency [cyc/mm]')
     ax.set_ylabel('|FFT| (log)')
     ax.set_title(f"FFT spectrum  (quality: {result['quality']}, "
-                 f"k_amp={result['k_amp']:.0f})")
+                 f"r_DC={result['dc_carrier_ratio']:.1f}, "
+                 f"SNR={result['carrier_snr']:.1f})")
     ax.set_xlim(-result['k_ideal']*1e-3, 3*result['k_ideal']*1e-3)
     ax.legend(fontsize=8, loc='upper right')
     ax.grid(True, which='both', alpha=0.3)
 
     # ─── Panel 3: envelopes & beam mask ──────────────────────────────────────
     ax = fig.add_subplot(gs[1, 0])
-    I0_n   = result['I0'] / result['I0'].max()
-    A1sq_n = (result['A1']**2) / (result['A1']**2).max()
-    ax.plot(x_mm, I0_n,   'C0', lw=1.3, label=r'$I_0$ (norm)')
-    ax.plot(x_mm, A1sq_n, 'C3', lw=1.3, label=r'$|A_{+1}|^2$ (norm)')
+    I0_n = result['I0'] / result['I0'].max()
+    A1_n = result['A1'] / result['A1'].max()
+    ax.plot(x_mm, I0_n, 'C0', lw=1.3, label=r'$I_0$ (norm)')
+    ax.plot(x_mm, A1_n, 'C3', lw=1.3, label=r'$A_{+1}$ (norm)')
     ax.fill_between(x_mm, 0, 1.05, where=m, color='gold', alpha=0.15,
                     label='beam_mask')
+    if rejected.any():
+        ax.fill_between(x_mm, 0, 1.05, where=rejected,
+                        color='lightcoral', alpha=0.35, hatch='///',
+                        edgecolor='firebrick', linewidth=0,
+                        label=r'excluded ($V < V_{\mathrm{thr}}$)')
     ax.axvline(0, color='C3', ls=':', lw=1, alpha=0.7)
     ax.set_xlabel('Position [mm] (x=0 at centroid)')
     ax.set_ylabel('Norm intensity')
-    ax.set_title(f"Envelopes & beam mask  ({result['n_mask_px']} px)")
+    ax.set_title(f"Envelopes  ({result['n_mask_px']} px beam, "
+                 f"{result['n_fit_px']} px fit)")
     ax.set_ylim(0, 1.05)
     ax.legend(fontsize=8, loc='upper right')
     ax.grid(alpha=0.3)
@@ -942,6 +1328,10 @@ def plot_result(result, title='', figsize=None):
         ylo, yhi = lo - 0.15*rng, hi + 0.15*rng
         ax.set_ylim(ylo, yhi)
         ax.fill_between(x_mm, ylo, yhi, where=m, color='gold', alpha=0.12)
+        if rejected.any():
+            ax.fill_between(x_mm, ylo, yhi, where=rejected,
+                            color='lightcoral', alpha=0.25, hatch='///',
+                            edgecolor='firebrick', linewidth=0)
         # X-limit: ±1.5 × beam_mask half-width
         x_beam   = x_mm[m]
         x_half   = (x_beam.max() - x_beam.min()) / 2
@@ -954,17 +1344,18 @@ def plot_result(result, title='', figsize=None):
     ax.legend(fontsize=8, loc='upper right')
     ax.grid(alpha=0.3)
 
-    # ─── Panel 5: residual (defocus removed) ─────────────────────────────────
+    # ─── Panel 5: residual (defocus removed, plotted over fit_mask) ──────────
     ax = fig.add_subplot(gs[2, :])
     W_resid_nm   = result['W_resid_rad'] * lam / (2*np.pi) * 1e9
-    W_resid_plot = np.where(m, W_resid_nm, np.nan)
+    W_resid_plot = np.where(fm, W_resid_nm, np.nan)
     ax.plot(x_mm, W_resid_plot, 'C4', lw=1.4)
     ax.axhline(0, color='gray', lw=0.7, alpha=0.5)
     ax.set_xlabel('Position [mm]')
     ax.set_ylabel('Residual [nm]')
-    ax.set_title('Residual (defocus removed)')
-    if m.any():
-        lo, hi = W_resid_nm[m].min(), W_resid_nm[m].max()
+    ax.set_title(f"Residual over fit_mask  "
+                 f"(rms={result['rms_resid_nm']:.3f} nm)")
+    if fm.any():
+        lo, hi = W_resid_nm[fm].min(), W_resid_nm[fm].max()
         rng = max(hi - lo, 0.01)
         ax.set_ylim(lo - 0.2*rng, hi + 0.2*rng)
     ax.grid(alpha=0.3)
@@ -988,21 +1379,43 @@ def plot_result(result, title='', figsize=None):
         ax.set_ylabel('x [mm]')
         ax.set_title('Caustic |E(x,z)|² (per-column normalized)')
         if m.any():
+            # Symmetric around x_m=0, with 20% padding
             x_beam = x_mm[m]
-            ax.set_ylim(x_beam.min()*1.2, x_beam.max()*1.2)
+            x_half = max(abs(x_beam.min()), abs(x_beam.max())) * 1.2
+            ax.set_ylim(-x_half, x_half)
         ax.legend(fontsize=8, loc='upper right')
         plt.colorbar(im, ax=ax, fraction=0.03, pad=0.01)
 
-        # Panel 7: σ_rms(z)
+        # Panel 7: beam size vs z (curve chosen by locator)
         ax = fig.add_subplot(gs[4, 0])
-        ax.plot(z, result['sigma_rms']*1e6, 'C0', lw=1.4)
+        locator = result.get('z_focus_locator', 'sigma_min')
+        if locator == 'fwhm_min':
+            curve     = result['fwhm_z']
+            curve_val = result['fwhm_focus']
+            ylabel    = 'FWHM/2.35 [µm]'
+            marker_lbl = (f"FWHM/2.35 at focus = {curve_val*1e6:.1f} µm"
+                          if not np.isnan(curve_val) else 'FWHM/2.35 = NaN')
+        else:
+            curve     = result['sigma_rms']
+            curve_val = result['sigma_focus']
+            ylabel    = 'σ_rms [µm]'
+            marker_lbl = f"σ_min = {curve_val*1e6:.1f} µm"
+
+        ax.plot(z, curve*1e6, 'C0', lw=1.4)
         ax.axvline(result['z_focus'], color='cyan', lw=1, ls='--')
-        ax.scatter([result['z_focus']], [result['sigma_focus']*1e6],
-                   color='red', s=40, zorder=5,
-                   label=f"σ_min = {result['sigma_focus']*1e6:.1f} µm")
+        # Mark search-window edges if a bounded search was actually used
+        if result.get('focus_search_halfwidth_m', 0) > 0 and 'f_pred' in result:
+            fp = result['f_pred']
+            hw = result['focus_search_halfwidth_m']
+            ax.axvspan(fp - hw, fp + hw, color='gray', alpha=0.08,
+                       label=f'search window (±{hw*1e3:.0f} mm)')
+        if not np.isnan(curve_val):
+            ax.scatter([result['z_focus']], [curve_val*1e6],
+                       color='red', s=40, zorder=5, label=marker_lbl)
         ax.set_xlabel('z [m]')
-        ax.set_ylabel('σ_rms [µm]')
-        ax.set_title('Beam size vs z')
+        ax.set_ylabel(ylabel)
+        title_suffix = ' *EDGE*' if result.get('focus_at_edge', False) else ''
+        ax.set_title(f"Beam size vs z  (locator: {locator}){title_suffix}")
         ax.legend(fontsize=8)
         ax.grid(alpha=0.3)
 
@@ -1039,5 +1452,149 @@ def plot_result(result, title='', figsize=None):
     if title:
         fig.suptitle(title, fontsize=14, fontweight='bold', y=1)
     fig.subplots_adjust(top=0.95, bottom=0.05, left=0.07, right=0.96)
+    plt.show()
+    return fig
+
+
+def plot_carrier(out, title='', figsize=(8, 4)):
+    """One-panel diagnostic for find_carrier output.
+
+    Shows |FFT| (log), the search band, k_ideal, and the located k_peak.
+
+    Parameters
+    ----------
+    out : dict
+        Output of find_carrier. Uses keys: freq, fft_avg, band, k_ideal,
+        k_peak, k_amp, dc_amp, bg_amp.
+    title : str, optional
+        Figure title.
+    figsize : tuple, optional
+        Default (8, 4).
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    """
+    freq    = out['freq']
+    fft_avg = out['fft_avg']
+    band_lo, band_hi = out['band']
+    k_ideal = out['k_ideal']
+    k_peak  = out['k_peak']
+    k_amp   = out['k_amp']
+    dc_amp  = out['dc_amp']
+    bg_amp  = out['bg_amp']
+    r_dc    = dc_amp / k_amp
+    snr     = k_amp / bg_amp
+
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.semilogy(freq * 1e-3, np.abs(fft_avg), lw=0.8,
+                color='steelblue', label='|FFT|')
+    ax.axvspan(band_lo * 1e-3, band_hi * 1e-3,
+               color='gold', alpha=0.2, label='search band')
+    ax.axvline(k_ideal * 1e-3, color='red',    ls=':',  lw=1,
+               label=f"k_ideal = {k_ideal*1e-3:.1f} cyc/mm")
+    ax.axvline(k_peak  * 1e-3, color='tomato', ls='--', lw=1.2,
+               label=f"k_peak  = {k_peak*1e-3:.1f} cyc/mm")
+    ax.axvline(0, color='gray', ls='--', lw=1, alpha=0.8, label='DC')
+    ax.set_xlabel('Spatial frequency [cyc/mm]')
+    ax.set_ylabel('|FFT| (log)')
+    ax.set_xlim(-k_ideal * 1e-3, 3 * k_ideal * 1e-3)
+    ax.set_title(
+        f"Carrier  (r_DC={r_dc:.1f}, SNR={snr:.1f}, "
+        f"k_peak/k_ideal={k_peak/k_ideal:.3f})"
+    )
+    ax.legend(fontsize=8, loc='upper right')
+    ax.grid(True, which='both', alpha=0.3)
+
+    if title:
+        fig.suptitle(title, fontsize=12, fontweight='bold')
+        fig.subplots_adjust(top=0.85)
+    plt.show()
+    return fig
+
+
+def plot_caustic_amplitude(debug, title='', figsize=(12, 3.5)):
+    """Three-panel diagnostic for build_caustic_amplitude(debug=True) output.
+
+    Panels:
+        1. Envelopes I0 and 2·A1 (normalized) with safety_mask shaded.
+        2. Visibility V = 2·A1/I0 (normalized) with V_threshold reference line.
+        3. Returned amplitude A with trust_mask shaded (gated mode only).
+
+    Parameters
+    ----------
+    debug : dict
+        Output of build_caustic_amplitude(..., debug=True). Uses keys:
+        A, V, safety_mask, trust_mask, mode_used, I0, A1, V_threshold.
+    title : str, optional
+        Figure suptitle.
+    figsize : tuple, optional
+        Default (12, 3.5).
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    """
+    A          = debug['A']
+    V          = debug['V']
+    I0         = debug['I0']
+    A1         = debug['A1']
+    safety_mask = debug['safety_mask']
+    trust_mask = debug['trust_mask']
+    mode_used  = debug['mode_used']
+    V_thr      = debug['V_threshold']
+
+    N = len(A)
+    px = np.arange(N)
+
+    fig, axs = plt.subplots(1, 3, figsize=figsize)
+
+    # ─── Panel 1: envelopes ─────────────────────────────────────────────────
+    ax = axs[0]
+    I0_n = I0 / I0.max() if I0.max() > 0 else I0
+    A1_n = (2*A1) / (2*A1).max() if A1.max() > 0 else 2*A1
+    ax.plot(px, I0_n, 'C0', lw=1.3, label=r'$I_0$ (norm)')
+    ax.plot(px, A1_n, 'C3', lw=1.3, label=r'$2\,A_{+1}$ (norm)')
+    ax.fill_between(px, 0, 1.05, where=safety_mask, color='gold', alpha=0.15,
+                    label='safety_mask')
+    ax.set_xlabel('Pixel index')
+    ax.set_ylabel('Norm intensity')
+    ax.set_ylim(0, 1.05)
+    ax.set_title('Envelopes')
+    ax.legend(fontsize=8, loc='upper right')
+    ax.grid(alpha=0.3)
+
+    # ─── Panel 2: visibility ────────────────────────────────────────────────
+    ax = axs[1]
+    ax.plot(px, V, 'C2', lw=1.3, label='V (norm)')
+    ax.axhline(V_thr, color='gray', ls='--', lw=1,
+               label=f'V_threshold = {V_thr:.2f}')
+    ax.fill_between(px, 0, 1.05, where=safety_mask, color='gold', alpha=0.10)
+    ax.set_xlabel('Pixel index')
+    ax.set_ylabel('Visibility')
+    ax.set_ylim(0, 1.05)
+    ax.set_title(r'Visibility $V = 2\,A_{+1}/I_0$')
+    ax.legend(fontsize=8, loc='upper right')
+    ax.grid(alpha=0.3)
+
+    # ─── Panel 3: returned amplitude ────────────────────────────────────────
+    ax = axs[2]
+    A_n = A / A.max() if A.max() > 0 else A
+    ax.plot(px, A_n, 'C1', lw=1.3, label='A (norm)')
+    if mode_used == 'gated':
+        ax.fill_between(px, 0, 1.05, where=trust_mask, color='lime', alpha=0.18,
+                        label='trust_mask')
+    ax.set_xlabel('Pixel index')
+    ax.set_ylabel('Norm amplitude')
+    ax.set_ylim(0, 1.05)
+    ax.set_title(f'Amplitude (mode={mode_used})')
+    ax.legend(fontsize=8, loc='upper right')
+    ax.grid(alpha=0.3)
+
+    if title:
+        fig.suptitle(title, fontsize=12, fontweight='bold')
+        fig.subplots_adjust(top=0.82)
+    else:
+        fig.tight_layout()
     plt.show()
     return fig
