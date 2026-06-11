@@ -24,6 +24,8 @@ __pycache__/
 !data/*.mat
 #!data/*.npy
 
+# Old version files
+*_old_*
 
 # C extensions
 *.so
