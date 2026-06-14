@@ -4,6 +4,10 @@ wfs_live.py
 
 X-ray wavefront sensor analysis pipeline for live beamline use.
 
+Author       : Wei "Francis" He (francisho@lbl.gov / whorwhey@gmail.com)
+Created      : May 2026
+Last updated : 2026-06-11
+
 Reconstructs the X-ray wavefront from a single shearing-interferometer
 image using grating-based lateral shearing interferometry. The pipeline
 takes a 2-D detector image (Talbot-plane interferogram), extracts the
@@ -58,10 +62,6 @@ This pipeline builds on work and discussions with:
     - Dr. Antoine İşlegen-Wojdyla (awojdyla@lbl.gov)
     - Dr. Xiaoya Chong
     - Dr. Ka Hung (Henry) Chan
-
-Author       : Wei "Francis" He (francisho@lbl.gov / whorwhey@gmail.com)
-Created      : May 2026
-Last updated : 2026-06-01
 """
 
 from __future__ import annotations
@@ -107,7 +107,8 @@ def fill_mask_gaps(mask):
     return filled
 
 
-def compute_visibility_masks(I0, A1, V_threshold=0.4, I0_threshold=0.02):
+def compute_visibility_masks(I0, A1, V_threshold=0.4, I0_threshold=0.02,
+                             beam_mask=None):
     """Compute normalized visibility V and the trust mask V > V_threshold.
 
     Single source of truth for V/trust_mask construction. Used by both
@@ -118,6 +119,10 @@ def compute_visibility_masks(I0, A1, V_threshold=0.4, I0_threshold=0.02):
     division by tiny intensities), then normalized to its in-mask max so
     V_threshold is interpreted as a fraction of peak visibility.
 
+    When `beam_mask` is provided, raw (V > V_threshold) is intersected with 
+    it before fill_mask_gaps, preventing out-of-beam spikes from anchoring 
+    the fill. Recommended whenever a beam_mask is available.
+
     Parameters
     ----------
     I0, A1 : ndarray (N,)
@@ -127,11 +132,15 @@ def compute_visibility_masks(I0, A1, V_threshold=0.4, I0_threshold=0.02):
         Fraction of peak visibility above which fringes are trusted.
     I0_threshold : float
         Fraction of max(I0) defining safety_mask (V-computation floor).
+    beam_mask : ndarray (N,) of bool, optional
+        Main-beam support (from find_phase_centroid). If provided, fills
+        are anchored only to True points inside beam_mask.
 
     Returns
     -------
     V           : ndarray (N,)         Normalized visibility (0 outside safety_mask)
-    trust_mask  : ndarray (N,) of bool Gap-filled (V > V_threshold)
+    trust_mask  : ndarray (N,) of bool Gap-filled (V > V_threshold), optionally
+                                       constrained to beam_mask before fill.
     safety_mask : ndarray (N,) of bool Gap-filled (I0 > I0_threshold * max)
     """
     I0 = np.asarray(I0, dtype=float)
@@ -142,7 +151,10 @@ def compute_visibility_masks(I0, A1, V_threshold=0.4, I0_threshold=0.02):
     V[safety_mask] = 2 * A1[safety_mask] / I0[safety_mask]
     if V[safety_mask].size and V[safety_mask].max() > 0:
         V /= V[safety_mask].max()
-    trust_mask = fill_mask_gaps(V > V_threshold)
+    raw_trust = V > V_threshold
+    if beam_mask is not None:
+        raw_trust = raw_trust & beam_mask
+    trust_mask = fill_mask_gaps(raw_trust)
     return V, trust_mask, safety_mask
 
 
@@ -332,6 +344,7 @@ def build_caustic_amplitude(
     V=None,
     trust_mask=None,
     safety_mask=None,
+    beam_mask=None,
     debug=False,
     plot=None,
 ):
@@ -358,6 +371,10 @@ def build_caustic_amplitude(
         Precomputed outputs of compute_visibility_masks. If any is None,
         all three are recomputed internally. Pass these from
         reconstruct_single to avoid redundant computation.
+    beam_mask : ndarray (N,) of bool, optional
+        Main-beam support. Used only when V/trust_mask/safety_mask are
+        recomputed here; passed through to compute_visibility_masks to
+        prevent out-of-beam anchors from corrupting trust_mask.
     debug : bool, optional (default False)
         If True, return a dict containing A plus diagnostic arrays
         (V, safety_mask, trust_mask, mode_used) instead of just A.
@@ -384,6 +401,7 @@ def build_caustic_amplitude(
     if V is None or trust_mask is None or safety_mask is None:
         V, trust_mask, safety_mask = compute_visibility_masks(
             I0, A1, V_threshold=V_threshold, I0_threshold=I0_threshold,
+            beam_mask=beam_mask
         )
 
     if mode == 'field_envelope':
@@ -1018,11 +1036,13 @@ def reconstruct_single(
     # --- Prepare fit_mask: beam_mask ∩ trust_mask ---
     # Trust mask excludes off-axis humps (high I0 but low V) that would
     # otherwise pollute the parabolic fit. Reused by Step 7 (caustic).
+    # beam_mask is passed to constrain fill_mask_gaps anchors to the main beam.
     V, trust_mask, safety_mask = compute_visibility_masks(
         env['I0'], env['A1'],
         V_threshold=V_threshold, I0_threshold=I0_threshold,
+        beam_mask=cen['beam_mask'],
     )
-    fit_mask = cen['beam_mask'] & trust_mask    
+    fit_mask = cen['beam_mask'] & trust_mask
 
     # --- Step 6: parabolic fit + f_pred ---
     fit = parabolic_focal_fit(wfr['W_rad'], wfr['x_m'], wavelength,
@@ -1509,7 +1529,7 @@ def plot_carrier(out, title='', figsize=(8, 4)):
     if title:
         fig.suptitle(title, fontsize=12, fontweight='bold')
         fig.subplots_adjust(top=0.85)
-    plt.show()
+    # plt.show()
     return fig
 
 
