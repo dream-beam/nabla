@@ -6,7 +6,7 @@ X-ray wavefront sensor analysis pipeline for live beamline use.
 
 Author       : Wei "Francis" He (francisho@lbl.gov / whorwhey@gmail.com)
 Created      : May 2026
-Last updated : 2026-06-11
+Last updated : 2026-06-15
 
 Reconstructs the X-ray wavefront from a single shearing-interferometer
 image using grating-based lateral shearing interferometry. The pipeline
@@ -677,8 +677,8 @@ def propagate_to_focus(
         Spatial coordinate. Defaults to (np.arange(N) - N//2) * dx.
     f_pred_m : float [m], optional
         Geometric focus from parabolic_focal_fit. Centers the bounded
-        search window. If None, falls back to global argmin on
-        sigma_rms with a warning.
+        search window. If None, falls back to global argmin on the
+        chosen locator curve with a warning.
     focus_search_halfwidth_m : float [m], optional
         Half-width of the search window around f_pred_m. If None,
         auto-computed as max(0.15 * |f_pred_m|, 0.05 m).
@@ -929,7 +929,8 @@ def reconstruct_single(
         3. extract_envelopes
         4. find_phase_centroid
         5. reconstruct_wavefront
-        6. parabolic_focal_fit
+        6. parabolic_focal_fit  (may soft-fail; pipeline continues with NaN
+                                 sentinels and fit_status='fail')
         7. (optional) propagate_to_focus + wavefront_at_focus
 
     Parameters
@@ -991,9 +992,18 @@ def reconstruct_single(
     -------
     result : dict
         Flat dict containing keys from all pipeline stages, plus:
-        - quality : 'good' / 'ok' / 'bad'
-        - W_nm    : reconstructed W in nm OPL (convenience)
-        - x_mm    : x_m in mm (convenience)
+        - quality          : 'good' / 'ok' / 'bad'  (from carrier r_DC)
+        - fit_status       : 'ok' / 'fail'          (parabolic fit outcome)
+        - fit_fail_reason  : str                    (empty on 'ok')
+        - W_nm             : reconstructed W in nm OPL (convenience)
+        - x_mm             : x_m in mm (convenience)
+
+        On fit failure, all step-6 numeric fields (f_pred, a2, rms_resid_nm,
+        pv_resid_nm) are NaN and W_para_rad / W_resid_rad are NaN-filled
+        arrays of the input shape. Propagation is skipped regardless of
+        the `propagate` flag; step-7/8 fields are absent from the result
+        dict. All upstream fields (W_rad, phase_unwrap, delta_phi,
+        envelopes, carrier stats, masks, quality) remain valid.
     """
     arr = np.asarray(image_or_profile, dtype=float)
 
@@ -1045,8 +1055,27 @@ def reconstruct_single(
     fit_mask = cen['beam_mask'] & trust_mask
 
     # --- Step 6: parabolic fit + f_pred ---
-    fit = parabolic_focal_fit(wfr['W_rad'], wfr['x_m'], wavelength,
-                              mask=fit_mask)
+    # Soft-fail: parabolic_focal_fit raises ValueError when fit_mask has <3
+    # pixels. Catch it so the pipeline still returns upstream results
+    # (W_rad, phase_unwrap, envelopes, carrier stats). Sentinel values are
+    # NaN to avoid any false-success appearance downstream.
+    try:
+        fit = parabolic_focal_fit(wfr['W_rad'], wfr['x_m'], wavelength,
+                                  mask=fit_mask)
+        fit_status, fit_fail_reason = 'ok', ''
+    except ValueError as exc:
+        nan_arr = np.full_like(wfr['W_rad'], np.nan)
+        fit = dict(
+            f_pred       = np.nan,
+            a2           = np.nan,
+            a1           = np.nan,
+            a0           = np.nan,
+            W_para_rad   = nan_arr,
+            W_resid_rad  = nan_arr,
+            rms_resid_nm = np.nan,
+            pv_resid_nm  = np.nan,
+        )
+        fit_status, fit_fail_reason = 'fail', str(exc)
 
     # Convenience conversions
     W_nm = wfr['W_rad'] * wavelength / (2 * np.pi) * 1e9
@@ -1104,6 +1133,8 @@ def reconstruct_single(
         W_resid_rad       = fit['W_resid_rad'],
         rms_resid_nm      = fit['rms_resid_nm'],
         pv_resid_nm       = fit['pv_resid_nm'],
+        fit_status        = fit_status,
+        fit_fail_reason   = fit_fail_reason,
         # raw stats
         rms_W_nm          = rms_W_nm,
         pv_W_nm           = pv_W_nm,
@@ -1115,7 +1146,9 @@ def reconstruct_single(
     )
 
     # --- Step 7: optional propagation ---
-    if propagate:
+    # Skipped on fit-fail (fit_mask empty → no coherent trust region to
+    # propagate). Caller must check fit_status before consuming step-7 fields.
+    if propagate and fit_status == 'ok':
         if z_range_m is None:
             half = max(abs(fit['f_pred']), 2.0)
             n_pts = int(half / 0.02) * 2 + 1   # ~20 mm step, odd count
@@ -1135,7 +1168,8 @@ def reconstruct_single(
             focus_search_halfwidth_m=focus_search_halfwidth_m,
             focus_locator=focus_locator,
         )
-        wff  = wavefront_at_focus(prop, wavelength, dx, threshold=focus_threshold)
+        wff = wavefront_at_focus(prop, wavelength, dx,
+                                 threshold=focus_threshold)
 
         result.update(dict(
             # step 7
@@ -1170,11 +1204,13 @@ def reconstruct_single(
                f"SNR={carrier_snr:.1f}  "
                f"f_pred={fit['f_pred']:+.2f}m  "
                f"RMS_W={rms_W_nm:.1f}nm  RMS_resid={fit['rms_resid_nm']:.3f}nm")
-        if propagate:
+        if propagate and fit_status == 'ok':
             edge_tag = ' *EDGE*' if prop['focus_at_edge'] else ''
             msg += (f"  z_focus={prop['z_focus']:+.2f}m"
                     f"({prop['z_focus_locator']}){edge_tag}  "
                     f"RMS@focus={wff['rms_at_focus_nm']:.3f}nm")
+        if fit_status == 'fail':
+            msg += f"  *FIT FAIL: {fit_fail_reason}*"
         print(msg)
 
     return result
@@ -1372,8 +1408,9 @@ def plot_result(result, title='', figsize=None):
     ax.axhline(0, color='gray', lw=0.7, alpha=0.5)
     ax.set_xlabel('Position [mm]')
     ax.set_ylabel('Residual [nm]')
+    fit_fail_tag = ' *FIT FAIL*' if result.get('fit_status') == 'fail' else ''
     ax.set_title(f"Residual over fit_mask  "
-                 f"(rms={result['rms_resid_nm']:.3f} nm)")
+                 f"(rms={result['rms_resid_nm']:.3f} nm){fit_fail_tag}")
     if fm.any():
         lo, hi = W_resid_nm[fm].min(), W_resid_nm[fm].max()
         rng = max(hi - lo, 0.01)
