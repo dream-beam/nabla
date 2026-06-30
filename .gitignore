@@ -15,6 +15,7 @@ wfs-als531/cache
 *.png
 *.csv
 *.tif
+*.tiff
 *.npy
 !assets/*.png
 !data/*.h5
