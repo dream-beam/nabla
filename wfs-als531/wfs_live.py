@@ -6,7 +6,7 @@ X-ray wavefront sensor analysis pipeline for live beamline use.
 
 Author       : Wei "Francis" He (francisho@lbl.gov / whorwhey@gmail.com)
 Created      : May 2026
-Last updated : 2026-06-22
+Last updated : 2026-06-28
 
 Reconstructs the X-ray wavefront from a single shearing-interferometer
 image using grating-based lateral shearing interferometry. The pipeline
@@ -520,7 +520,9 @@ def reconstruct_wavefront(complex_1st, dx, grating_pitch, wavelength, z_gd, x_c)
     z_gd : float [m]
         Grating-to-detector distance.
     x_c : int
-        Phase reference pixel index (from find_phase_centroid).
+        Pixel used as the phase and wavefront reference: Δφ and W are both
+        zero here, and x_m = 0 here. Pass a fixed value across frames for
+        gauge-consistent comparisons within a scan series.
 
     Returns
     -------
@@ -923,6 +925,7 @@ def reconstruct_single(
     focus_locator='fwhm_min',
     r_good=50, r_bad=200, 
     verbose=False,
+    x_c_override=None,
 ):
     """Full single-frame WFS pipeline: image → wavefront (+ optional propagation).
 
@@ -989,6 +992,12 @@ def reconstruct_single(
         calibration.
     verbose : bool
         Print a one-line summary.
+    x_c_override : int or None, optional
+        Fix the phase and wavefront reference pixel for all frames in a scan
+        series. The per-frame centroid is still computed (for beam_mask), but
+        x_c_override is used as the gauge anchor instead. result['x_c'] always
+        reports the value actually used. Default None uses the per-frame
+        centroid.
 
     Returns
     -------
@@ -1043,8 +1052,9 @@ def reconstruct_single(
                               fill_gaps=fill_gaps)
 
     # --- Step 5: wavefront ---
+    x_c = x_c_override if x_c_override is not None else cen['x_c']
     wfr = reconstruct_wavefront(env['complex_1st'], dx, grating_pitch,
-                                wavelength, z_gd, x_c=cen['x_c'])
+                                wavelength, z_gd, x_c=x_c)
     # --- Prepare fit_mask: beam_mask ∩ trust_mask ---
     # Trust mask excludes off-axis humps (high I0 but low V) that would
     # otherwise pollute the parabolic fit. Reused by Step 7 (caustic).
@@ -1111,7 +1121,7 @@ def reconstruct_single(
         sigma_0           = env['sigma_0'],
         sigma_1           = env['sigma_1'],
         # step 4
-        x_c               = cen['x_c'],
+        x_c               = x_c,
         beam_mask         = cen['beam_mask'],
         n_mask_px         = cen['n_mask_px'],
         # fit-mask preparation (used by step 6 and step 7)
