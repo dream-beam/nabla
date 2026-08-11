@@ -6,7 +6,7 @@ X-ray wavefront sensor analysis pipeline for live beamline use.
 
 Author       : Wei "Francis" He (francisho@lbl.gov / whorwhey@gmail.com)
 Created      : May 2026
-Last updated : 2026-06-15
+Last updated : 2026-06-28
 
 Reconstructs the X-ray wavefront from a single shearing-interferometer
 image using grating-based lateral shearing interferometry. The pipeline
@@ -115,9 +115,9 @@ def compute_visibility_masks(I0, A1, V_threshold=0.4, I0_threshold=0.02,
     parabolic_focal_fit (via fit_mask = beam_mask ∩ trust_mask) and
     build_caustic_amplitude (gated-mode amplitude support).
 
-    V is computed only inside safety_mask (an I0 floor that guards against
-    division by tiny intensities), then normalized to its in-mask max so
-    V_threshold is interpreted as a fraction of peak visibility.
+    V is computed inside safety_mask (an I0 floor guarding division by 
+    tiny intensities), then normalized to its peak inside beam_mask if 
+    provided, else inside safety_mask.
 
     When `beam_mask` is provided, raw (V > V_threshold) is intersected with 
     it before fill_mask_gaps, preventing out-of-beam spikes from anchoring 
@@ -149,8 +149,11 @@ def compute_visibility_masks(I0, A1, V_threshold=0.4, I0_threshold=0.02,
     safety_mask = fill_mask_gaps(I0 > I0_threshold * I0.max())
     V = np.zeros_like(I0)
     V[safety_mask] = 2 * A1[safety_mask] / I0[safety_mask]
-    if V[safety_mask].size and V[safety_mask].max() > 0:
-        V /= V[safety_mask].max()
+
+    # Normalize to in-beam peak when available; else fall back to safety_mask.
+    norm_mask = beam_mask if beam_mask is not None else safety_mask
+    if V[norm_mask].size and V[norm_mask].max() > 0:
+        V /= V[norm_mask].max()
     raw_trust = V > V_threshold
     if beam_mask is not None:
         raw_trust = raw_trust & beam_mask
@@ -316,8 +319,8 @@ def extract_envelopes(fft_avg, freq, k_peak,
     gauss_lp    = np.exp(-0.5 * (freq / sigma_0)**2)
     fft_filt_0  = fft_avg * gauss_lp
     complex_0th = np.fft.ifft(np.fft.ifftshift(fft_filt_0))
-    I0          = np.abs(complex_0th)        # intensity envelope; linear after 2026-06-01 audit
-
+    I0          = np.abs(complex_0th)        # linear magnitude (Decision A)
+    
     # +1-order: bandpass Gaussian centered at f = k_peak
     gauss_bp    = np.exp(-0.5 * ((freq - k_peak) / sigma_1)**2)
     fft_filt_1  = fft_avg * gauss_bp
@@ -481,7 +484,7 @@ def find_phase_centroid(I0, A1, threshold=None, fill_gaps=True):
             f"Check I0 (max={I0.max():.3g}) or lower threshold."
         )
 
-    weights = A1[beam_mask]        # A1 is intensity (b/2); linear weighting → standard intensity-weighted centroid (2026-06-01 audit)
+    weights = A1[beam_mask]        # linear A1 weighting (Decision F)
     x_idx   = np.arange(len(I0))
     x_c     = int(np.average(x_idx[beam_mask], weights=weights))
 
@@ -517,7 +520,9 @@ def reconstruct_wavefront(complex_1st, dx, grating_pitch, wavelength, z_gd, x_c)
     z_gd : float [m]
         Grating-to-detector distance.
     x_c : int
-        Phase reference pixel index (from find_phase_centroid).
+        Pixel used as the phase and wavefront reference: Δφ and W are both
+        zero here, and x_m = 0 here. Pass a fixed value across frames for
+        gauge-consistent comparisons within a scan series.
 
     Returns
     -------
@@ -543,7 +548,7 @@ def reconstruct_wavefront(complex_1st, dx, grating_pitch, wavelength, z_gd, x_c)
     # 3. Differential phase
     delta_phi = phase_unwrap - carrier_ramp
 
-    # 4. Integrate (sign follows May 19 convention; flip if your +1/−1 order differs)
+    # 4. Integrate (negative cumsum; flip if your +1/−1 order differs)
     W_temp = -np.cumsum(delta_phi) * dx * grating_pitch / wavelength / z_gd
 
     # 5. Re-center at x_c
@@ -920,6 +925,7 @@ def reconstruct_single(
     focus_locator='fwhm_min',
     r_good=50, r_bad=200, 
     verbose=False,
+    x_c_override=None,
 ):
     """Full single-frame WFS pipeline: image → wavefront (+ optional propagation).
 
@@ -956,7 +962,7 @@ def reconstruct_single(
         Set False to disable gap-fill when off-axis structure would be
         incorrectly bridged into the main beam (Stage B off-axis hump case).
     propagate : bool
-        If True, run steps 8a + 8b (propagation + W at focus).
+        If True, run steps 7–8 (propagation + W at focus).
     z_range_m : array_like, optional
         Custom z range for propagation. If None, auto-set from f_pred.
     focus_threshold : float
@@ -966,13 +972,12 @@ def reconstruct_single(
         See that function for mode semantics.
     V_threshold, I0_threshold : float
         Forwarded to build_caustic_amplitude when caustic_amplitude='gated'.
-    focus_search_halfwidth_m : float [m], default 0.2
+    focus_search_halfwidth_m : float [m], optional
         Half-width of the bounded search window for focus localization.
         z_focus is selected as the argmin of the chosen locator curve
-        within [f_pred - halfwidth, f_pred + halfwidth]. Prevents
-        off-axis wing structure from pulling z_focus to a spurious
-        upstream location.
-    focus_locator : {'sigma_min', 'fwhm_min', 'geometric'}, default 'sigma_min'
+        within [f_pred - halfwidth, f_pred + halfwidth]. If None
+        (default), auto-computed as max(0.15 * |f_pred|, 0.05) m.
+    focus_locator : {'sigma_min', 'fwhm_min', 'geometric'}, default 'fwhm_min'
         Curve to minimize for z_focus. 'sigma_min' uses σ_rms(z),
         'fwhm_min' uses FWHM(z), 'geometric' skips the search and
         sets z_focus = f_pred.
@@ -987,6 +992,12 @@ def reconstruct_single(
         calibration.
     verbose : bool
         Print a one-line summary.
+    x_c_override : int or None, optional
+        Fix the phase and wavefront reference pixel for all frames in a scan
+        series. The per-frame centroid is still computed (for beam_mask), but
+        x_c_override is used as the gauge anchor instead. result['x_c'] always
+        reports the value actually used. Default None uses the per-frame
+        centroid.
 
     Returns
     -------
@@ -1041,8 +1052,9 @@ def reconstruct_single(
                               fill_gaps=fill_gaps)
 
     # --- Step 5: wavefront ---
+    x_c = x_c_override if x_c_override is not None else cen['x_c']
     wfr = reconstruct_wavefront(env['complex_1st'], dx, grating_pitch,
-                                wavelength, z_gd, x_c=cen['x_c'])
+                                wavelength, z_gd, x_c=x_c)
     # --- Prepare fit_mask: beam_mask ∩ trust_mask ---
     # Trust mask excludes off-axis humps (high I0 but low V) that would
     # otherwise pollute the parabolic fit. Reused by Step 7 (caustic).
@@ -1109,7 +1121,7 @@ def reconstruct_single(
         sigma_0           = env['sigma_0'],
         sigma_1           = env['sigma_1'],
         # step 4
-        x_c               = cen['x_c'],
+        x_c               = x_c,
         beam_mask         = cen['beam_mask'],
         n_mask_px         = cen['n_mask_px'],
         # fit-mask preparation (used by step 6 and step 7)
@@ -1271,7 +1283,7 @@ def quick_look(
 # PLOTTING
 # ════════════════════════════════════════════════════════════════════════════
 
-def plot_result(result, title='', figsize=None):
+def plot_result(result, title='', figsize=None, x_axis='centered'):
     """Diagnostic figure for a single-frame reconstruction.
 
     Panels (always shown):
@@ -1283,7 +1295,7 @@ def plot_result(result, title='', figsize=None):
 
     Additional panels (if propagation was run):
         6. Caustic |E(x,z)|²
-        7. σ_rms(z)
+        7. Beam size vs z (locator-dependent: σ_rms or FWHM/2.35)
         8. Intensity at focus + wavefront at focus (twin y-axis)
 
     Parameters
@@ -1294,6 +1306,10 @@ def plot_result(result, title='', figsize=None):
         Optional figure suptitle.
     figsize : tuple, optional
         Auto-sized if None.
+    x_axis : {'centered', 'raw'}, default 'centered'
+        Spatial coordinate convention for panels 3–8. 'centered' puts
+        x=0 at the centroid (uses result['x_mm']); 'raw' uses detector
+        coordinates (np.arange(N)*dx). Panel 1 is always raw.
 
     Returns
     -------
@@ -1308,8 +1324,21 @@ def plot_result(result, title='', figsize=None):
     n_rows = 5 if has_prop else 3
     gs = fig.add_gridspec(n_rows, 2, hspace=0.55, wspace=0.25)
 
-    x_mm  = result['x_mm']
-    N     = len(result['profile'])
+    N         = len(result['profile'])
+    x_full_mm = np.arange(N) * result['dx'] * 1e3   # raw detector mm
+    x_c_mm    = x_full_mm[result['x_c']]            # centroid in raw mm
+
+    if x_axis == 'centered':
+        x_plot = result['x_mm']
+        x_ref  = 0.0
+        xlabel = 'Position [mm] (x=0 at centroid)'
+    elif x_axis == 'raw':
+        x_plot = x_full_mm
+        x_ref  = x_c_mm
+        xlabel = 'Position [mm] (detector frame)'
+    else:
+        raise ValueError(f"x_axis must be 'centered' or 'raw', got {x_axis!r}")
+
     freq  = result['freq']
     m     = result['beam_mask']
     fm    = result['fit_mask']
@@ -1318,7 +1347,6 @@ def plot_result(result, title='', figsize=None):
 
     # ─── Panel 1: raw fringe profile ─────────────────────────────────────────
     ax = fig.add_subplot(gs[0, 0])
-    x_full_mm = np.arange(N) * result['dx'] * 1e3
     ax.plot(x_full_mm, result['profile'], lw=0.7, color='steelblue')
     ax.axvline(x_full_mm[result['x_c']], color='C3', ls=':', lw=1,
                label=f"x_c (px {result['x_c']})")
@@ -1351,17 +1379,17 @@ def plot_result(result, title='', figsize=None):
     ax = fig.add_subplot(gs[1, 0])
     I0_n = result['I0'] / result['I0'].max()
     A1_n = result['A1'] / result['A1'].max()
-    ax.plot(x_mm, I0_n, 'C0', lw=1.3, label=r'$I_0$ (norm)')
-    ax.plot(x_mm, A1_n, 'C3', lw=1.3, label=r'$A_{+1}$ (norm)')
-    ax.fill_between(x_mm, 0, 1.05, where=m, color='gold', alpha=0.15,
+    ax.plot(x_plot, I0_n, 'C0', lw=1.3, label=r'$I_0$ (norm)')
+    ax.plot(x_plot, A1_n, 'C3', lw=1.3, label=r'$A_{+1}$ (norm)')
+    ax.fill_between(x_plot, 0, 1.05, where=m, color='gold', alpha=0.15,
                     label='beam_mask')
     if rejected.any():
-        ax.fill_between(x_mm, 0, 1.05, where=rejected,
+        ax.fill_between(x_plot, 0, 1.05, where=rejected,
                         color='lightcoral', alpha=0.35, hatch='///',
                         edgecolor='firebrick', linewidth=0,
                         label=r'excluded ($V < V_{\mathrm{thr}}$)')
-    ax.axvline(0, color='C3', ls=':', lw=1, alpha=0.7)
-    ax.set_xlabel('Position [mm] (x=0 at centroid)')
+    ax.axvline(x_ref, color='C3', ls=':', lw=1, alpha=0.7)
+    ax.set_xlabel(xlabel)
     ax.set_ylabel('Norm intensity')
     ax.set_title(f"Envelopes  ({result['n_mask_px']} px beam, "
                  f"{result['n_fit_px']} px fit)")
@@ -1374,27 +1402,26 @@ def plot_result(result, title='', figsize=None):
     W_para_nm   = result['W_para_rad'] * lam / (2*np.pi) * 1e9
     W_plot      = np.where(m, result['W_nm'], np.nan)
     W_para_plot = np.where(m, W_para_nm,      np.nan)
-    ax.plot(x_mm, result['W_nm'], 'C0', lw=0.6, alpha=0.3, label='W (outside)')
-    ax.plot(x_mm, W_plot,         'C0', lw=1.5, label='W measured')
-    ax.plot(x_mm, W_para_plot,    'C3', lw=1.2, ls='--',
+    ax.plot(x_plot, result['W_nm'], 'C0', lw=0.6, alpha=0.3, label='W (outside)')
+    ax.plot(x_plot, W_plot,         'C0', lw=1.5, label='W measured')
+    ax.plot(x_plot, W_para_plot,    'C3', lw=1.2, ls='--',
             label=f"parabolic (f={result['f_pred']:+.2f} m)")
     if m.any():
         lo, hi = result['W_nm'][m].min(), result['W_nm'][m].max()
         rng = hi - lo if hi > lo else 1.0
         ylo, yhi = lo - 0.15*rng, hi + 0.15*rng
         ax.set_ylim(ylo, yhi)
-        ax.fill_between(x_mm, ylo, yhi, where=m, color='gold', alpha=0.12)
+        ax.fill_between(x_plot, ylo, yhi, where=m, color='gold', alpha=0.12)
         if rejected.any():
-            ax.fill_between(x_mm, ylo, yhi, where=rejected,
+            ax.fill_between(x_plot, ylo, yhi, where=rejected,
                             color='lightcoral', alpha=0.25, hatch='///',
                             edgecolor='firebrick', linewidth=0)
-        # X-limit: ±1.5 × beam_mask half-width
-        x_beam   = x_mm[m]
+        x_beam   = x_plot[m]
         x_half   = (x_beam.max() - x_beam.min()) / 2
         x_center = (x_beam.max() + x_beam.min()) / 2
         ax.set_xlim(x_center - 1.5*x_half, x_center + 1.5*x_half)
-    ax.axvline(0, color='gray', ls=':', lw=0.7, alpha=0.6)
-    ax.set_xlabel('Position [mm]')
+    ax.axvline(x_ref, color='gray', ls=':', lw=0.7, alpha=0.6)
+    ax.set_xlabel(xlabel)
     ax.set_ylabel('W [nm OPL]')
     ax.set_title('Wavefront')
     ax.legend(fontsize=8, loc='upper right')
@@ -1404,9 +1431,9 @@ def plot_result(result, title='', figsize=None):
     ax = fig.add_subplot(gs[2, :])
     W_resid_nm   = result['W_resid_rad'] * lam / (2*np.pi) * 1e9
     W_resid_plot = np.where(fm, W_resid_nm, np.nan)
-    ax.plot(x_mm, W_resid_plot, 'C4', lw=1.4)
+    ax.plot(x_plot, W_resid_plot, 'C4', lw=1.4)
     ax.axhline(0, color='gray', lw=0.7, alpha=0.5)
-    ax.set_xlabel('Position [mm]')
+    ax.set_xlabel(xlabel)
     ax.set_ylabel('Residual [nm]')
     fit_fail_tag = ' *FIT FAIL*' if result.get('fit_status') == 'fail' else ''
     ax.set_title(f"Residual over fit_mask  "
@@ -1426,7 +1453,7 @@ def plot_result(result, title='', figsize=None):
         ax = fig.add_subplot(gs[3, :])
         I_norm = result['I_caustic'] / result['I_caustic'].max(axis=0, keepdims=True)
         im = ax.imshow(I_norm,
-                       extent=(z[0], z[-1], x_mm[0], x_mm[-1]),
+                       extent=(z[0], z[-1], x_plot[0], x_plot[-1]),
                        aspect='auto', origin='lower', cmap='inferno')
         ax.axvline(result['z_focus'], color='cyan', lw=1.2, ls='--',
                    label=f"z_focus = {result['z_focus']:+.2f} m")
@@ -1436,16 +1463,15 @@ def plot_result(result, title='', figsize=None):
         ax.set_ylabel('x [mm]')
         ax.set_title('Caustic |E(x,z)|² (per-column normalized)')
         if m.any():
-            # Symmetric around x_m=0, with 20% padding
-            x_beam = x_mm[m]
-            x_half = max(abs(x_beam.min()), abs(x_beam.max())) * 1.2
-            ax.set_ylim(-x_half, x_half)
+            x_beam = x_plot[m]
+            x_half = max(abs(x_beam.min() - x_ref), abs(x_beam.max() - x_ref)) * 1.2
+            ax.set_ylim(x_ref - x_half, x_ref + x_half)
         ax.legend(fontsize=8, loc='upper right')
         plt.colorbar(im, ax=ax, fraction=0.03, pad=0.01)
 
         # Panel 7: beam size vs z (curve chosen by locator)
         ax = fig.add_subplot(gs[4, 0])
-        locator = result.get('z_focus_locator', 'sigma_min')
+        locator = result.get('z_focus_locator', 'fwhm_min')
         if locator == 'fwhm_min':
             curve     = result['fwhm_z']
             curve_val = result['fwhm_focus']
@@ -1479,15 +1505,15 @@ def plot_result(result, title='', figsize=None):
         # Panel 8: focus intensity + W at focus (twin axis)
         ax = fig.add_subplot(gs[4, 1])
         I_focus_norm = result['I_focus'] / result['I_focus'].max()
-        ax.plot(x_mm, I_focus_norm, 'C1', lw=1.4, label='I (norm)')
-        ax.fill_between(x_mm, 0, 1.05, where=m_f, color='gold', alpha=0.15)
-        ax.set_xlabel('x [mm]')
+        ax.plot(x_plot, I_focus_norm, 'C1', lw=1.4, label='I (norm)')
+        ax.fill_between(x_plot, 0, 1.05, where=m_f, color='gold', alpha=0.15)
+        ax.set_xlabel(xlabel)
         ax.set_ylabel('Norm intensity', color='C1')
         ax.tick_params(axis='y', labelcolor='C1')
         ax.set_ylim(0, 1.05)
         # X-limit: ±1.5 × focus_mask half-width
         if m_f.any():
-            x_f      = x_mm[m_f]
+            x_f      = x_plot[m_f]
             x_half   = (x_f.max() - x_f.min()) / 2
             x_center = (x_f.max() + x_f.min()) / 2
             ax.set_xlim(x_center - 1.5*x_half, x_center + 1.5*x_half)
@@ -1495,7 +1521,7 @@ def plot_result(result, title='', figsize=None):
         # Wavefront on twin axis
         ax2 = ax.twinx()
         W_focus_plot = np.where(m_f, result['W_focus_nm'], np.nan)
-        ax2.plot(x_mm, W_focus_plot, 'C4', lw=1.3, label='W at focus')
+        ax2.plot(x_plot, W_focus_plot, 'C4', lw=1.3, label='W at focus')
         ax2.set_ylabel('W at focus [nm]', color='C4')
         ax2.tick_params(axis='y', labelcolor='C4')
         if m_f.any():
@@ -1566,7 +1592,7 @@ def plot_carrier(out, title='', figsize=(8, 4)):
     if title:
         fig.suptitle(title, fontsize=12, fontweight='bold')
         fig.subplots_adjust(top=0.85)
-    # plt.show()
+
     return fig
 
 

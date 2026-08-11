@@ -10,11 +10,20 @@ __pycache__/
 # cache files
 wfs-als531/cache
 
+# shadow3 product
+effic.0*
+mirr.0*
+optax.0*
+rmir.0*
+star.0*
+fort.33
+
 #
 *.mat
 *.png
 *.csv
 *.tif
+*.tiff
 *.npy
 !assets/*.png
 !data/*.h5
