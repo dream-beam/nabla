@@ -66,6 +66,14 @@ and connect to it from the companion notebook (``als531_shadow4.ipynb``)
 or any other EPICS client using ``ophyd``/``caproto``/``pyepics``.
 """
 
+
+#export EPICS_CAS_AUTO_BEACON_ADDR_LIST=no
+#export EPICS_CAS_BEACON_ADDR_LIST="127.0.0.1"
+
+#with a mac in a terminal you need to have
+# caproto-repeater
+
+
 from __future__ import annotations
 
 import asyncio
@@ -73,10 +81,23 @@ import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 from textwrap import dedent
+import platform
+import os
+
+# Disable caproto beacon on macOS to prevent CaprotoNetworkError (broadcast restricted)
+if platform.system() == "Darwin":
+    os.environ["EPICS_CAS_AUTO_BEACON_ADDR_LIST"] = "no"
 
 import numpy as np
 
+import caproto.server.common
 from caproto.server import PVGroup, SubGroup, ioc_arg_parser, pvproperty, run
+
+# Robustly disable caproto beacon on macOS to prevent CaprotoNetworkError (broadcast restricted)
+if platform.system() == "Darwin":
+    async def _disabled_beacon(*args, **kwargs):
+        pass
+    caproto.server.common.broadcast_beacon_loop = _disabled_beacon
 
 from als531_shadow4_sim import (
     CAMERA_NX,
